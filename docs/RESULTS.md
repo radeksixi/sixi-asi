@@ -26,9 +26,20 @@ other versions and engines carry their own date or version.
 This test is five prompts, and it is decided by which text gets written: two builds whose answers differ in a few
 tokens can differ by ten percent and more on it, because the drafter then agrees with the model for a different
 share of the text. That is what moved Q4_K_M from 46.0 to 52.9 and the default weights from 44.1 to 43.2 between rc1
-and rc2; a speculative step itself is 3-5% cheaper in rc2 on both. Longer runs are the better measure: the
-50-problem quality gate below runs at 68.7 tok/s in rc2 against 66.7 in rc1, and three concurrent clients at 44.3
-tok/s each against 41.2.
+and rc2. The 60-prompt set below is the better measure, and so are longer runs: the 50-problem quality gate runs at
+68.7 tok/s in rc2 against 66.7 in rc1, and three concurrent clients at 44.3 tok/s each against 41.2.
+
+**One stream, a larger set** (60 prompts: 30 GSM8K problems, 20 HumanEval tasks, 10 everyday questions; greedy, 256
+tokens, no reasoning phase; 13.5k generated tokens; two runs per version agree to 0.1 tok/s; the script ships with
+the next release):
+
+| Version | tok/s | Time per speculative step | Tokens accepted per step | Math / code / everyday prose, tok/s |
+|---|---|---|---|---|
+| **Sixi-ASI 1.0.0-rc2** | **54.7** | 114.6 ms | 6.27 | 59.4 / 105.8 / 25.7 |
+| Sixi-ASI 1.0.0-rc1 | 51.4 | 120.3 ms | 6.19 | 56.6 / 100.6 / 24.0 |
+
+This is the figure to compare versions by: rc2 is 6% faster than rc1 on one stream. How fast an answer is written
+depends on the text: code is drafted several times better than everyday prose.
 
 **Concurrent requests** (`scripts/concurrency_bench.py`: every client answers the same five prompts, rotated, so
 the streams carry equal work; total = all completion tokens / wall time, prompt loading included). 1-4 streams on

@@ -136,6 +136,7 @@ comparison with other engines are in [docs/RESULTS.md](docs/RESULTS.md); what ch
 | | |
 |---|---|
 | Qwen3.8-27B, one stream, default weights (UD-Q4_K_XL v3.1) | 43.2 tok/s, 3.6x plain decoding |
+| The same over 60 prompts (math, code, everyday questions) | 54.7 tok/s (1.0.0-rc1: 51.4) |
 | Qwen3.8-27B, 2 / 4 / 8 / 32 requests at once, in total | 70 / 108 / 125 / 172 tok/s |
 | llama.cpp v1.0.0 on the same machine and weights, built-in MTP drafts | 29.3 tok/s |
 | 16 agents with an 18k-token prompt each: wait for the next turn | 3 s |
