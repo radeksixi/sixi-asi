@@ -3,6 +3,16 @@
 Versions of the Sixi-ASI Engine, newest first. Numbers are from NVIDIA Jetson AGX Thor; how each was measured is in
 [docs/RESULTS.md](docs/RESULTS.md).
 
+## 1.0.0-rc2
+
+| Area | Change |
+|---|---|
+| Fix | a streamed answer with a character split across two tokens (an emoji, for instance) could stop the server; fixed |
+| Images | a message can carry pictures (`image_url` parts); the same loaded Qwen3.8-27B answers, in parallel with text requests, and a picture stays in the conversation's memory |
+| Priority | `"priority": "background"` and `--reserve-interactive N`: batch work no longer delays the turn a person is waiting for (first token 0.26 s instead of 1.8 s next to a long prompt being loaded) |
+| Speed | 2 and 4 requests at once 64 -> 70 and 98 -> 108 tok/s in total; long runs 3-7% faster; quality gates unchanged |
+| Speech | `speech/sixi-speech`: speech recognition and synthesis on the CPU with the OpenAI audio API, for a talking agent ([docs/VOICE-AGENT.md](docs/VOICE-AGENT.md)) |
+
 ## 1.0.0-rc1
 
 | Area | Change |

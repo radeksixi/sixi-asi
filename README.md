@@ -3,12 +3,12 @@
 Run Qwen3.8 on an NVIDIA Jetson AGX Thor. An inference engine with speculative decoding that leaves the answers
 unchanged, parallel streams and an OpenAI-compatible API, as one download.
 
-Measured with Qwen3.8-27B on an NVIDIA Jetson AGX Thor: **44 tok/s on one stream** (3.7x plain decoding at 12.1)
-and **171 tok/s in total with 32 requests at once**. [How it was measured](docs/RESULTS.md).
+Measured with Qwen3.8-27B on an NVIDIA Jetson AGX Thor: **43 tok/s on one stream** (3.6x plain decoding at 12.1)
+and **172 tok/s in total with 32 requests at once**. [How it was measured](docs/RESULTS.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/streams-dark.svg">
-  <img src="assets/streams-light.svg" alt="Total tokens per second with 4, 8, 16 and 32 concurrent requests on NVIDIA Jetson AGX Thor, Qwen3.8-27B Q4_K_M with the DSpine drafter. Version 0.10: 94.2, 113.5, 128.8, 129.4. Version 1.0.0-rc1: 102.9, 129.0, 143.7, 172.0." width="100%">
+  <img src="assets/streams-light.svg" alt="Total tokens per second with 4, 8, 16 and 32 concurrent requests on NVIDIA Jetson AGX Thor, Qwen3.8-27B Q4_K_M with the DSpine drafter. Version 0.10: 94.2, 113.5, 128.8, 129.4. Version 1.0.0-rc2: 104.8, 129.5, 156.0, 172.5." width="100%">
 </picture>
 
 ## Quick start
@@ -20,12 +20,12 @@ Download `sixi-asi-<version>-jetson-thor-aarch64.tar.gz` and its `.sha256` from 
 sha256sum -c sixi-asi-*-jetson-thor-aarch64.tar.gz.sha256
 tar xzf sixi-asi-*-jetson-thor-aarch64.tar.gz && cd sixi-asi-*-jetson-thor-aarch64
 ./sixi setup      # checks that this machine can run the release (nothing is built)
-./sixi pull       # downloads Qwen3.8-27B and its drafter: 18.9 GB, resumable, checksummed
+./sixi pull       # downloads Qwen3.8-27B, its drafter and image projector: 19.8 GB, resumable, checksummed
 ./sixi chat       # talk to it in the terminal
 ```
 
 **You need** an NVIDIA Jetson AGX Thor with JetPack (the file `BUILD` in the archive names the L4T and CUDA versions
-the release was built with), 18.9 GB of disk for the default model, and Python 3.8+ for the `sixi` command.
+the release was built with), 19.8 GB of disk for the default model, and Python 3.8+ for the `sixi` command.
 Other NVIDIA machines are not covered by this release.
 
 ## Use it
@@ -101,7 +101,7 @@ field, the extra metrics in the response and the error codes are in [docs/API.md
 
 | Name | Weights | Download | Notes |
 |---|---|---|---|
-| `qwen3.8-27b` (default) | Qwen3.8-27B, Unsloth Dynamic v3.1 UD-Q4_K_XL, with the DSpine block drafter | 18.9 GB | the measured configuration; parallel streams |
+| `qwen3.8-27b` (default) | Qwen3.8-27B, Unsloth Dynamic v3.1 UD-Q4_K_XL, with the DSpine block drafter and the image projector | 19.8 GB | the measured configuration; parallel streams; images |
 | `qwen3.8-flash-next` | Qwen3.8-Flash-Next (mixture of experts), UD-IQ4_XS, with its MTP draft head | 97.8 GB | one stream with drafts |
 
 Both are Apache-2.0 and are downloaded from their authors' Hugging Face repositories (`configs/models.json` has the
@@ -115,6 +115,11 @@ repositories, sizes and checksums). No model is part of this archive.
   loaded does not stall the other conversations.
 - **Structured answers.** `response_format` constrains the answer to one JSON object or to a JSON schema, also
   with drafts and parallel streams; a finished answer always parses and nothing follows its closing brace.
+- **Images.** A message can carry pictures as `image_url` parts; the same loaded model answers them, next to text
+  requests, and a picture stays in the conversation's memory.
+- **Priority.** `"priority": "background"` keeps batch work out of the way of the turn a person is waiting for.
+- **A talking agent.** `speech/sixi-speech` adds speech recognition and synthesis on CPU cores with the OpenAI
+  audio API; [docs/VOICE-AGENT.md](docs/VOICE-AGENT.md) puts text, vision and speech together.
 - **Samples and voting.** `n` samples of one prompt cost one prompt load; `"vote": true` returns the majority
   answer and stops the rest once it is decided.
 - **Prompt cache.** A conversation continues from where it stopped, and a repeated prompt starts answering in
@@ -124,17 +129,20 @@ repositories, sizes and checksums). No model is part of this archive.
 
 ## Performance
 
-NVIDIA Jetson AGX Thor, 1.0.0-rc1, measured on the files of this archive. Full tables, quality gates and the
+NVIDIA Jetson AGX Thor, 1.0.0-rc2, measured on the files of this archive. Full tables, quality gates and the
 comparison with other engines are in [docs/RESULTS.md](docs/RESULTS.md); what changed in each version is in
 [CHANGELOG.md](CHANGELOG.md).
 
 | | |
 |---|---|
-| Qwen3.8-27B, one stream, default weights (UD-Q4_K_XL v3.1) | 44.1 tok/s, 3.7x plain decoding |
-| Qwen3.8-27B, 4 / 16 / 32 requests at once, in total | 98 / 152 / 171 tok/s |
+| Qwen3.8-27B, one stream, default weights (UD-Q4_K_XL v3.1) | 43.2 tok/s, 3.6x plain decoding |
+| Qwen3.8-27B, 2 / 4 / 8 / 32 requests at once, in total | 70 / 108 / 125 / 172 tok/s |
 | llama.cpp v1.0.0 on the same machine and weights, built-in MTP drafts | 29.3 tok/s |
-| 16 agents with an 18k-token prompt each: wait for the next turn | under 3 s |
-| JSON answers that parse, with a schema (120 cases) | 120 of 120 (103 without the constraint) |
+| 16 agents with an 18k-token prompt each: wait for the next turn | 3 s |
+| JSON answers that parse, with a schema (120 cases) | 118 of 120 (103 without the constraint) |
+| A turn next to four background requests: first token | 0.18-0.26 s |
+| A spoken question to the first audio of the answer (speech on the CPU) | 1.0-1.5 s |
+| A picture: load / next turn about the same picture | 0.6-1.2 s / 0.1 s |
 | Qwen3.8-Flash-Next, one stream | 53 tok/s on code, 45 in conversation |
 | Context memory for 32 streams | 27.1 GB |
 | Default weights against BF16 | KL divergence 0.008 |
@@ -158,5 +166,6 @@ reference's, so any OpenAI-compatible server on the same machine can be put next
 
 The archive is free to use for any purpose and to pass on unchanged: see its `LICENSE` file (`LICENSE-BINARY` in
 this repository). It includes llama.cpp, cpp-httplib and nlohmann/json under their MIT licenses (`licenses/`).
-From 1.0.0-rc1 the engine is released in binary form; the sources in this repository are those of 0.11.0
-(Apache-2.0, `LICENSE`).
+From 1.0.0-rc1 the engine is released in binary form (the `sixi` and `sixi-speech` commands and the measurement
+scripts in the archive are plain Python); the sources in this repository are those of 0.11.0 (Apache-2.0,
+`LICENSE`).

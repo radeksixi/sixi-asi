@@ -17,6 +17,7 @@ by default. With `--api-key KEY` (or `SIXI_API_KEY`) every endpoint except `/hea
 | Field | Meaning |
 |---|---|
 | `messages` | `[{"role": "system" \| "user" \| "assistant" \| "tool", "content": "..."}]`; assistant turns may carry `reasoning_content` and `tool_calls`, tool turns `tool_call_id` and `name` |
+| images | `content` may be a list of parts: `{"type": "text", "text": "..."}` and `{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}`; see below |
 | `prompt` | a raw prompt instead of `messages`: the chat template is not applied |
 | `max_tokens` (`max_completion_tokens`) | limit on generated tokens, reasoning included; also capped by the context window |
 | `temperature`, `top_k`, `top_p`, `seed` | sampling; `temperature` 0 is greedy. Same seed, same answer |
@@ -29,6 +30,7 @@ by default. With `--api-key KEY` (or `SIXI_API_KEY`) every endpoint except `/hea
 | `answer_budget_tokens` | limit on answer tokens alone |
 | `response_format` | structured answer, see below |
 | `tools` | OpenAI tool definitions; calls come back validated against their schema as `tool_calls` |
+| `priority` | `"interactive"` (default) or `"background"`; see below |
 | `n` | several samples of one prompt with seeds `seed .. seed + n - 1`, decoded as parallel streams (`n` may not exceed `--max-concurrent`, which is at least `--parallel`; not with `stream`) |
 | `vote` | with `n`: `true` or `{"answer_regex": "...", "stop_on_agreement": true}`; the response carries the majority answer |
 | `stop_on_loop`, `stop_on_reasoning_loop` | what to do when the output starts repeating itself |
@@ -74,6 +76,34 @@ each request has its own grammar state. Reasoning is not constrained; the gramma
   overruled its choice at least once. The grammar guarantees the syntax, not the meaning: text that is legal inside
   a string stays there even when the model meant it as a closing (a typographic quote followed by a brace, for
   instance), so an answer with a non-zero count is worth a second look.
+
+### Images
+
+With a projector loaded (`--mmproj`; `./sixi` adds the one of the model's registry entry) a message's `content` can
+mix text and images. An image is an `image_url` part with a `data:` URI (base64 of a jpg, png, bmp or gif file);
+remote URLs are not fetched. Parts are joined in order without separators, as in llama.cpp's server, and the same
+loaded model answers: there is no second model.
+
+- An image costs rows of context and loading time in proportion to its size: about 300 rows and 0.6 s for a
+  small picture, over 2000 rows and 4 s for a large one. `--image-max-tokens N` bounds the rows per image (512
+  gives about 1.2 s); small text in a picture needs more rows to be read.
+- An image is part of the prompt prefix like text: the next turn of the same conversation does not load it again
+  (first token after about 0.1 s), and the same picture sent by another request is recognised by its content.
+- Requests with images run in parallel streams with requests without; drafts continue after an image.
+- `usage.prompt_tokens` counts the image's rows.
+
+### Priority
+
+Work that nobody is waiting for can say so: `"priority": "background"`. Such a request
+
+- loads its prompt in small chunks and hands the device to other requests between them,
+- lets interactive requests go first wherever requests queue,
+- waits for a free slot (up to two minutes) instead of failing with 429, and never takes the slots set aside
+  with `--reserve-interactive N`.
+
+Measured on a Jetson AGX Thor with `--parallel 4 --reserve-interactive 1`: an interactive turn gets its first
+token after 0.14 s alone and after a median of 0.26 s (0.7 s at worst) while four background requests load
+4k-token prompts; without the priority field the same turn waits about 1.8 s behind one such load.
 
 ### Errors
 

@@ -9,30 +9,32 @@
 <text x="124.8" y="74.0" fill="#52514e" font-size="12" text-anchor="start" font-weight="400">other engines</text>
 <line x1="330.0" y1="92" x2="330.0" y2="246" stroke="#e4e3de" stroke-width="1"/>
 <text x="330.0" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">0</text>
-<line x1="422.0" y1="92" x2="422.0" y2="246" stroke="#e4e3de" stroke-width="1"/>
-<text x="422.0" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">10</text>
-<line x1="514.0" y1="92" x2="514.0" y2="246" stroke="#e4e3de" stroke-width="1"/>
-<text x="514.0" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">20</text>
-<line x1="606.0" y1="92" x2="606.0" y2="246" stroke="#e4e3de" stroke-width="1"/>
-<text x="606.0" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">30</text>
-<line x1="698.0" y1="92" x2="698.0" y2="246" stroke="#e4e3de" stroke-width="1"/>
-<text x="698.0" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">40</text>
+<line x1="406.7" y1="92" x2="406.7" y2="246" stroke="#e4e3de" stroke-width="1"/>
+<text x="406.7" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">10</text>
+<line x1="483.3" y1="92" x2="483.3" y2="246" stroke="#e4e3de" stroke-width="1"/>
+<text x="483.3" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">20</text>
+<line x1="560.0" y1="92" x2="560.0" y2="246" stroke="#e4e3de" stroke-width="1"/>
+<text x="560.0" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">30</text>
+<line x1="636.7" y1="92" x2="636.7" y2="246" stroke="#e4e3de" stroke-width="1"/>
+<text x="636.7" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">40</text>
+<line x1="713.3" y1="92" x2="713.3" y2="246" stroke="#e4e3de" stroke-width="1"/>
+<text x="713.3" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">50</text>
 <line x1="790.0" y1="92" x2="790.0" y2="246" stroke="#e4e3de" stroke-width="1"/>
-<text x="790.0" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">50</text>
+<text x="790.0" y="264.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">60</text>
 <text x="560.0" y="282.0" fill="#898781" font-size="11" text-anchor="middle" font-weight="400">decode tokens per second (higher is better)</text>
-<text x="318.0" y="113.0" fill="#0b0b0b" font-size="13" text-anchor="end" font-weight="600">Sixi-ASI 1.0.0-rc1 · DSpine drafter (Q4_K_M)</text>
-<path d="M330.0,100.0 h419.2 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-419.2 z" fill="#2a78d6"/>
-<text x="761.2" y="113.0" fill="#0b0b0b" font-size="13" text-anchor="start" font-weight="600">46.0</text>
+<text x="318.0" y="113.0" fill="#0b0b0b" font-size="13" text-anchor="end" font-weight="600">Sixi-ASI 1.0.0-rc2 · DSpine drafter (Q4_K_M)</text>
+<path d="M330.0,100.0 h401.6 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-401.6 z" fill="#2a78d6"/>
+<text x="743.6" y="113.0" fill="#0b0b0b" font-size="13" text-anchor="start" font-weight="600">52.9</text>
 <text x="318.0" y="143.0" fill="#52514e" font-size="13" text-anchor="end" font-weight="400">TensorRT Edge-LLM 0.11.1 · DFlash2 (NVFP4)</text>
-<path d="M330.0,130.0 h413.7 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-413.7 z" fill="#8f8d86"/>
-<text x="755.7" y="143.0" fill="#0b0b0b" font-size="13" text-anchor="start" font-weight="600">45.4</text>
-<text x="318.0" y="173.0" fill="#0b0b0b" font-size="13" text-anchor="end" font-weight="600">Sixi-ASI 1.0.0-rc1 · DSpine (UD-Q4_K_XL, default)</text>
-<path d="M330.0,160.0 h401.7 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-401.7 z" fill="#2a78d6"/>
-<text x="743.7" y="173.0" fill="#0b0b0b" font-size="13" text-anchor="start" font-weight="600">44.1</text>
+<path d="M330.0,130.0 h344.1 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-344.1 z" fill="#8f8d86"/>
+<text x="686.1" y="143.0" fill="#0b0b0b" font-size="13" text-anchor="start" font-weight="600">45.4</text>
+<text x="318.0" y="173.0" fill="#0b0b0b" font-size="13" text-anchor="end" font-weight="600">Sixi-ASI 1.0.0-rc2 · DSpine (UD-Q4_K_XL, default)</text>
+<path d="M330.0,160.0 h327.2 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-327.2 z" fill="#2a78d6"/>
+<text x="669.2" y="173.0" fill="#0b0b0b" font-size="13" text-anchor="start" font-weight="600">43.2</text>
 <text x="318.0" y="203.0" fill="#52514e" font-size="13" text-anchor="end" font-weight="400">llama.cpp v1.0.0 llama-server · built-in MTP</text>
-<path d="M330.0,190.0 h265.6 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-265.6 z" fill="#8f8d86"/>
-<text x="607.6" y="203.0" fill="#0b0b0b" font-size="13" text-anchor="start" font-weight="600">29.3</text>
+<path d="M330.0,190.0 h220.6 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-220.6 z" fill="#8f8d86"/>
+<text x="562.6" y="203.0" fill="#0b0b0b" font-size="13" text-anchor="start" font-weight="600">29.3</text>
 <text x="318.0" y="233.0" fill="#52514e" font-size="13" text-anchor="end" font-weight="400">llama.cpp v1.0.0 llama-server · plain decoding</text>
-<path d="M330.0,220.0 h107.3 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-107.3 z" fill="#8f8d86"/>
-<text x="449.3" y="233.0" fill="#0b0b0b" font-size="13" text-anchor="start" font-weight="600">12.1</text>
+<path d="M330.0,220.0 h88.8 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-88.8 z" fill="#8f8d86"/>
+<text x="430.8" y="233.0" fill="#0b0b0b" font-size="13" text-anchor="start" font-weight="600">12.1</text>
 </svg>

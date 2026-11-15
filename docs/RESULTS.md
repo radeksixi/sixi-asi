@@ -1,28 +1,34 @@
 # Measured results
 
 NVIDIA Jetson AGX Thor developer kit (122.9 GiB unified LPDDR5X, CUDA 13.2, MAXN). Qwen3.8-27B unless noted,
-greedy, identical prompts for every engine, 256 generated tokens. The 1.0.0-rc1 rows were measured on 2026-11-14 on
-the files of the released archive, with nothing else on the GPU; rows of other versions and engines carry their
-own date or version.
+greedy, identical prompts for every engine, 256 generated tokens. The 1.0.0-rc2 rows were measured on 2026-11-15 and
+the 1.0.0-rc1 rows on 2026-11-14, each on the files of its released archive, with nothing else on the GPU; rows of
+other versions and engines carry their own date or version.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../assets/engines-dark.svg">
-  <img src="../assets/engines-light.svg" alt="Decode tokens per second, one stream, Qwen3.8-27B on NVIDIA Jetson AGX Thor: Sixi-ASI 1.0.0-rc1 with the DSpine drafter on Q4_K_M 46.0, TensorRT Edge-LLM 0.11.1 DFlash2 45.4, Sixi-ASI 1.0.0-rc1 DSpine on UD-Q4_K_XL (default) 44.1, llama.cpp v1.0.0 llama-server with built-in MTP 29.3, llama.cpp v1.0.0 llama-server plain decoding 12.1" width="100%">
+  <img src="../assets/engines-light.svg" alt="Decode tokens per second, one stream, Qwen3.8-27B on NVIDIA Jetson AGX Thor: Sixi-ASI 1.0.0-rc2 with the DSpine drafter on Q4_K_M 52.9, TensorRT Edge-LLM 0.11.1 DFlash2 45.4, Sixi-ASI 1.0.0-rc2 DSpine on UD-Q4_K_XL (default) 43.2, llama.cpp v1.0.0 llama-server with built-in MTP 29.3, llama.cpp v1.0.0 llama-server plain decoding 12.1" width="100%">
 </picture>
 
 **One stream** (`scripts/ab_bench.py`, median of 3 runs per task, mean of 5 tasks):
 
 | Engine | Weights | Drafter | tok/s | vs plain decoding |
 |---|---|---|---|---|
-| **Sixi-ASI 1.0.0-rc1** | Q4_K_M | DSpine b16 | **46.0** | **3.8x** |
+| **Sixi-ASI 1.0.0-rc2** | Q4_K_M | DSpine b16 | **52.9** | **4.4x** |
+| Sixi-ASI 1.0.0-rc1 | Q4_K_M | DSpine b16 | 46.0 | 3.8x |
 | TensorRT Edge-LLM 0.11.1 (2026-11-12) | NVFP4 | DFlash2 | 45.4 | 3.8x |
-| **Sixi-ASI 1.0.0-rc1** | UD-Q4_K_XL v3.1 (default) | DSpine b16 | **44.1** | 3.7x |
+| **Sixi-ASI 1.0.0-rc2** | UD-Q4_K_XL v3.1 (default) | DSpine b16 | **43.2** | 3.6x |
+| Sixi-ASI 1.0.0-rc1 | UD-Q4_K_XL v3.1 (default) | DSpine b16 | 44.1 | 3.7x |
 | llama.cpp v1.0.0, llama-server | UD-Q4_K_XL v3.1 | built-in MTP, 4 drafts | 29.3 | 2.4x |
 | llama.cpp v1.0.0, llama-server | UD-Q4_K_XL v3.1 | built-in MTP, 3 drafts, q4_0 KV cache | 27.3 | 2.3x |
 | llama.cpp v1.0.0, llama-server, plain decoding | UD-Q4_K_XL v3.1 | - | 12.1 | 1.0x |
 
-This test is five prompts. Two runs whose answers differ in a few tokens can differ by several percent on it,
-because the drafter then agrees with the model for a different share of the text.
+This test is five prompts, and it is decided by which text gets written: two builds whose answers differ in a few
+tokens can differ by ten percent and more on it, because the drafter then agrees with the model for a different
+share of the text. That is what moved Q4_K_M from 46.0 to 52.9 and the default weights from 44.1 to 43.2 between rc1
+and rc2; a speculative step itself is 3-5% cheaper in rc2 on both. Longer runs are the better measure: the
+50-problem quality gate below runs at 68.7 tok/s in rc2 against 66.7 in rc1, and three concurrent clients at 44.3
+tok/s each against 41.2.
 
 **Concurrent requests** (`scripts/concurrency_bench.py`: every client answers the same five prompts, rotated, so
 the streams carry equal work; total = all completion tokens / wall time, prompt loading included). 1-4 streams on
@@ -30,28 +36,30 @@ the streams carry equal work; total = all completion tokens / wall time, prompt 
 
 | Concurrent streams | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---|---|---|---|---|---|
-| 1.0.0-rc1, UD-Q4_K_XL v3.1 (default) | 38.2 | 63.9 | 97.7 | 117.1 | 151.7 | **171.0** |
-| 1.0.0-rc1, Q4_K_M | 40.5 | 65.7 | 102.9 | 129.0 | 143.7 | **172.0** |
+| 1.0.0-rc2, UD-Q4_K_XL v3.1 (default) | 38.4 | 70.0 | 108.2 | 124.9 | 144.4 | **171.8** |
+| 1.0.0-rc2, Q4_K_M | 45.8 | 73.7 | 104.8 | 129.5 | 156.0 | **172.5** |
+| 1.0.0-rc1, UD-Q4_K_XL v3.1 | 38.2 | 63.9 | 97.7 | 117.1 | 151.7 | 171.0 |
 | 0.11, UD-Q4_K_XL v3.1 | 37.7 | 63.7 | 90.3 | 118.7 | 150.6 | 170.5 |
 | 0.10, Q4_K_M | 39.6 | 62.1 | 94.2 | 113.5 | 128.8 | 129.4 |
 
-The default-weights figures for 8, 16 and 32 streams are means of three runs (112.9-122.8, 145.9-155.1,
-169.3-172.6); the others are single runs, and a single run at 8-16 streams spreads by several percent.
+The default-weights figures for 8, 16 and 32 streams are means of three runs (rc2: 122.2-127.5, 137.5-154.9,
+170.2-174.0); the others are single runs, and a single run at 8-16 streams spreads by several percent.
 
 With 32 streams each one decodes at 5.4-5.9 tok/s; with 16, about 10. Context memory for 32 streams: 27.1 GB
 (25.3 GiB) for the model and 6.0 GB (5.6 GiB) for the drafter.
 
 **Many agents with long prompts** (`scripts/agents_bench.py`: 16 agents, each with its own 18k-token document and
 two follow-up questions, `--parallel 16 --ctx 24576`, default weights): a follow-up reaches its first token after
-2.8 s (median), 2.9 s at worst, while other agents are still loading their documents; the first answer takes 272 s
-(median) because sixteen 18k-token loads share one device. All three turns of all agents: 553 s.
+3.0 s (median), 3.2 s at worst, while other agents are still loading their documents (rc1: 2.8 and 2.9 s). All three
+turns of all agents: 567 s (rc1: 553 s).
 
 **Quality gate** (`scripts/intel_eval.py`, reasoning effort low, thinking on, greedy, up to 8192 tokens):
 
 | Run | GSM8K | HumanEval | Tool calls | Needle (6k) |
 |---|---|---|---|---|
+| Sixi-ASI 1.0.0-rc2, DSpine, UD-Q4_K_XL v3.1 | 28/30 | 19/20 | pass | pass |
+| same, as three concurrent clients on `--parallel 4` | 28/30 each | 19/20 each | pass | pass |
 | Sixi-ASI 1.0.0-rc1, DSpine, UD-Q4_K_XL v3.1 | 28/30 | 19/20 | pass | pass |
-| same, as three concurrent clients on `--parallel 4` | 28/30 each | 18, 19, 19 of 20 | pass | pass |
 | Sixi-ASI 0.11, DSpine, UD-Q4_K_XL v3.1 | 28/30 | 19/20 | pass | pass |
 | Sixi-ASI 0.10, DSpine, Q4_K_M, wider sample | 76/80 | 58/60 | | |
 | TensorRT Edge-LLM, DFlash2, NVFP4 (0.9.0 run) | 28/30 | 19/20 | pass | pass |
@@ -65,22 +73,57 @@ characters, and the scores above are the same either way. Repeated solo runs are
 
 | Set | With the constraint | Without |
 |---|---|---|
-| 10 agent-style schemas x 3 prompts in five languages, one stream | 30/30 valid | 23/30 |
-| 30 general schemas x 3 prompts, one stream | 90/90 | 80/90 |
+| 10 agent-style schemas x 3 prompts in five languages, one stream | 30/30 valid | 24/30 |
+| 30 general schemas x 3 prompts, one stream | 88/90; two answers reached `max_tokens` inside the document (`finish_reason: length`) | 79/90 |
 | agent schemas, 8 streams | 30/30 | |
-| general schemas, 8 streams | 89/90; one answer reached `max_tokens` inside the document (`finish_reason: length`) | |
+| general schemas, 8 streams | 90/90 | |
 | general schemas, sampled (temperature above 0) | 90/90 | |
 | general schemas with reasoning on | 30/30 | |
 
-The constraint costs about 2% of the speed on answers the model would have written correctly anyway (2-5% over a whole set).
+The constraint costs about 2% of the speed on answers the model would have written correctly anyway (2-5% over a
+whole set). The two unfinished answers are the model's own: a counting loop that the unconstrained answer has too,
+and a string it closed with the wrong quote character, which is legal text inside a string. In rc1 the same set
+gave 90/90 and 89/90 (8 streams): which prompts go wrong moves with small numerical changes.
+
+**Images** (the model's own projector; six prompts with one or two pictures, greedy, next to llama.cpp v1.0.0's
+server with the same projector): the prompts come to the same number of tokens in all six cases, the answers say
+the same; one of the six is identical to the character, the others part ways at a word choice. A small
+picture (about 300 rows) loads in 0.6 s, a large one capped with `--image-max-tokens 512` in 1.2 s; in the next turn
+of the same conversation the picture costs nothing (first token after 0.11 s). Requests with and without pictures
+run side by side.
+
+**A turn a person waits for, next to background work** (`scripts/voice_latency.py`, `--parallel 8
+--reserve-interactive 1`; first token of a short streamed turn):
+
+| Meanwhile | Median | Worst |
+|---|---|---|
+| nothing | 0.14 s | 0.15 s |
+| 4 background requests generating | 0.18 s | 0.25 s |
+| 4 background requests loading 4k-token prompts | 0.26 s | 0.61 s |
+| 2 generating and 2 loading | 0.26 s | 0.54 s |
+| one request loading a 4k-token prompt without `"priority": "background"` | 1.8 s | 2.2 s |
+
+**A whole spoken turn** (`scripts/voice_turn_demo.py`: the question as audio, speech recognition and synthesis by
+`sixi-speech` on the CPU, the answer spoken sentence by sentence):
+
+| Question | Understood after | First token | First audio of the answer, after the question ended | Whole turn |
+|---|---|---|---|---|
+| English | 0.17 s | 0.25 s | 1.5 s | 1.8 s for 7.1 s of speech |
+| German | 0.10 s | 0.20 s | 1.5 s | 1.7 s for 6.4 s of speech |
+| Italian | 0.14 s | 0.20 s | 1.0 s | 1.6 s for 5.3 s of speech |
+| English, about a picture | 0.11 s | 1.2 s | 2.1 s | 2.1 s for 2.7 s of speech |
+
+Speech recognition (Parakeet TDT 0.6b v3): a 4-6 s utterance in 0.2-0.35 s. Speech synthesis (Piper voices): 2-3 s
+of speech in 0.3-0.4 s. Both on CPU cores; the language model's first token is the same with the speech service
+idle or busy.
 
 **Qwen3.8-Flash-Next** (UD-IQ4_XS with its MTP head, one stream, benchmark program with a fixed draft length,
 median of three repeats):
 
 | | Plain decoding | With drafts |
 |---|---|---|
-| Code prompt | 26.2 | 52.8 |
-| Conversation prompt | 28.3 | 44.6 |
+| Code prompt | 28.5 | 53.2 |
+| Conversation prompt | 28.2 | 44.6 |
 
 **Hard reasoning** (0.11 run: 40 AIME problems, 3 samples each, temperature 0.6, reasoning effort low, 10240 tokens,
 4 streams):
