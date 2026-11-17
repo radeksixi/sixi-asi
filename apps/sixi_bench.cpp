@@ -291,6 +291,7 @@ int main(int argc, char** argv) {
     std::string out_json_path;
     std::string draft_model_path;
     std::string mtp_model_path;
+    std::string mtp_draft_vocab_path;
     float temperature = 0.0f;
     uint32_t n_rs_seq = 16;
     uint32_t n_threads = 8;
@@ -319,6 +320,7 @@ int main(int argc, char** argv) {
         else if (arg == "--out" && i + 1 < argc) out_json_path = argv[++i];
         else if (arg == "--draft-model" && i + 1 < argc) draft_model_path = argv[++i];
         else if (arg == "--mtp-model" && i + 1 < argc) mtp_model_path = argv[++i];
+        else if (arg == "--mtp-draft-vocab" && i + 1 < argc) mtp_draft_vocab_path = argv[++i];
         else if (arg == "--temperature" && i + 1 < argc) temperature = std::stof(argv[++i]);
         else if (arg == "--n-rs-seq" && i + 1 < argc) n_rs_seq = static_cast<uint32_t>(std::stoul(argv[++i]));
         else if (arg == "--threads" && i + 1 < argc) n_threads = static_cast<uint32_t>(std::stoul(argv[++i]));
@@ -355,6 +357,7 @@ int main(int argc, char** argv) {
         lopts.model_path = model_path;
         lopts.draft_model_path = draft_model_path;
         lopts.mtp_model_path = mtp_model_path;
+        lopts.mtp_draft_vocab_path = mtp_draft_vocab_path;
         lopts.n_rs_seq = n_rs_seq;
         lopts.device_snapshot_slots = 0; // the bench measures the raw decode path
         lopts.n_threads = n_threads;
@@ -619,6 +622,10 @@ int main(int argc, char** argv) {
     std::vector<double> decode_tps_samples;
     double total_draft_ms = 0.0;
     double total_verify_ms = 0.0;
+    // Per repeat, in run order: the first repeat of a model with memory-mapped tables runs cold.
+    std::vector<double> draft_ms_samples;
+    std::vector<double> verify_ms_samples;
+    std::vector<uint64_t> draft_calls_samples;
     double mean_accept_len = 1.0;
     uint64_t total_fallbacks = 0;
     uint64_t total_suffix_hits = 0;
@@ -628,6 +635,10 @@ int main(int argc, char** argv) {
     uint32_t completion_tokens_count = 0;
 
     for (uint32_t r = 0; r < repeats; ++r) {
+        // Wall-clock mark per repeat, so that an outside sampler (page faults, disk reads) can be lined up with it.
+        std::cerr << "sixi-bench: repeat " << r << " starts at "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch()).count() << " ms\n";
         auto run_res = execute_benchmark_run(backend, prompt, max_tokens, spec_k, mode, temperature);
         if (!run_res.ok()) {
             std::cerr << "Benchmark run failed: " << run_res.message() << "\n";
@@ -642,6 +653,9 @@ int main(int argc, char** argv) {
         decode_tps_samples.push_back(m.decode_tok_s);
         total_draft_ms += m.draft_ms;
         total_verify_ms += m.verify_ms;
+        draft_ms_samples.push_back(m.draft_ms);
+        verify_ms_samples.push_back(m.verify_ms);
+        draft_calls_samples.push_back(spec_k > 0 ? m.neural_draft_calls : 0);
         if (spec_k > 0) {
             mean_accept_len = m.mean_accept_len;
             total_fallbacks += m.fallbacks;
@@ -670,6 +684,13 @@ int main(int argc, char** argv) {
     report["mean_acceptance_length"] = mean_accept_len;
     report["total_draft_ms"] = total_draft_ms;
     report["total_verify_ms"] = total_verify_ms;
+    report["samples"] = {
+        {"decode_tok_per_s", decode_tps_samples},
+        {"ttft_ms", ttft_samples_ms},
+        {"draft_ms", draft_ms_samples},
+        {"verify_ms", verify_ms_samples},
+        {"neural_draft_calls", draft_calls_samples}
+    };
     report["suffix_hits"] = total_suffix_hits;
     report["neural_draft_calls"] = total_neural_calls;
     report["rollbacks_executed"] = total_rollbacks;

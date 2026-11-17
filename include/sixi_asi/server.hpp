@@ -201,6 +201,12 @@ struct ChatCompletionRequest {
     bool include_rendered_prompt = false;   // debug: echo the rendered prompt in the response
     std::vector<ToolDefinition> tools;
     std::vector<std::string> tools_json;    // raw tool objects for template rendering (optional)
+    // response_format: JSON schema (text) the answer must match; empty = free text. The answer is decoded under a
+    // grammar built from it (reasoning stays free), so a finished answer always parses and nothing follows it.
+    std::string response_schema_json;
+    std::vector<std::string> images;        // image files of `image_url` parts, in the order of their markers in the messages
+    bool background = false;                // "priority": "background": its prompt is loaded in small chunks, so that an
+                                            // interactive request never waits long for the device
 };
 
 struct ChatCompletionResponse {
@@ -220,6 +226,9 @@ struct ChatCompletionResponse {
     double prefill_tok_per_s = 0.0;
     double decode_tok_per_s = 0.0;
     double mean_acceptance_length = 1.0;
+    bool constrained = false;               // the answer was decoded under a response_format grammar
+    uint32_t constraint_rows_changed = 0;   // positions where the model's own choice was refused by the grammar
+    uint32_t constraint_drafts_refused = 0; // drafted tokens the grammar refused before the target saw them accepted
     double prefill_ms = 0.0;                // backend prefill only (excludes snapshot and first decode step)
     double snapshot_ms = 0.0;               // post-prefill state snapshot for the prefix cache (0 if none)
     std::string rendered_prompt;            // only when include_rendered_prompt
@@ -262,6 +271,7 @@ struct ServerConfig {
     // (default) runs them one at a time, FIFO; a backend loaded with N parallel streams decodes N requests at
     // once and batches their forward passes.
     uint32_t max_concurrent_requests = 1;
+    uint32_t reserve_interactive = 0;       // slots that requests with "priority": "background" never take
     uint32_t n_ctx = 4096;                  // context window of the backend (caps prompt + max_tokens)
     ExecutionMode execution_mode = ExecutionMode::StrictReplay;
     uint32_t draft_k = 0;                   // 0 = auto (backend rollback window, capped at 7 = llama.cpp MMVQ batch limit - 1)

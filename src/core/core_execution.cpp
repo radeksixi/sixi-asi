@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <unordered_map>
 #include <thread>
 #include <numeric>
 #include <string_view>
@@ -595,6 +596,12 @@ int32_t DeterministicSampler::sample_from_candidates(
         cdf += c.prob;
         if (u < cdf) {
             return c.id;
+        }
+    }
+    // Rounding left u at or above the sum: the last candidate that has any probability (never a masked token)
+    for (auto it = cands.rbegin(); it != cands.rend(); ++it) {
+        if (it->prob > 0.0) {
+            return it->id;
         }
     }
     return cands.back().id;
@@ -1181,7 +1188,22 @@ struct LlamaSamplerSeqConfigRaw {
     void* sampler;
 };
 
+// The library's log reaches the service log. At debug level it writes one line per graph input on every graph
+// reserve: 2.1 of 2.2 million lines after two days of a service in use. Debug lines are dropped unless
+// SIXI_LLAMA_LOG=debug; SIXI_LLAMA_LOG=warn or =error keeps less. A continuation line follows the line it continues.
+static int g_llama_log_min_level = 2;   // GGML_LOG_LEVEL_INFO
+static void sixi_llama_log(int level, const char* text, void* /*user*/) {
+    static thread_local bool dropped = false;
+    if (level != 5 /* GGML_LOG_LEVEL_CONT */) {
+        dropped = level != 0 /* NONE: plain output */ && level < g_llama_log_min_level;
+    }
+    if (!dropped && text != nullptr) {
+        std::fputs(text, stderr);
+    }
+}
+
 using fn_llama_backend_init_t = void (*)();
+using fn_llama_log_set_t = void (*)(void (*)(int, const char*, void*), void*);
 using fn_llama_model_default_params_t = LlamaModelParamsOpaque (*)();
 using fn_llama_context_default_params_t = LlamaContextParamsOpaque (*)();
 using fn_llama_sampler_chain_default_params_t = LlamaSamplerChainParamsRaw (*)();
@@ -1189,6 +1211,26 @@ using fn_llama_sampler_chain_init_t = void* (*)(LlamaSamplerChainParamsRaw);
 using fn_llama_sampler_chain_add_t = void (*)(void*, void*);
 using fn_llama_sampler_init_greedy_t = void* (*)();
 using fn_llama_sampler_free_t = void (*)(void*);
+// Grammar sampler (constrained decoding). llama_token_data / llama_token_data_array as in llama.h.
+struct LlamaTokenDataRaw {
+    int32_t id;
+    float logit;
+    float p;
+};
+struct LlamaTokenDataArrayRaw {
+    LlamaTokenDataRaw* data;
+    size_t size;
+    int64_t selected;
+    bool sorted;
+};
+static_assert(sizeof(LlamaTokenDataRaw) == 12, "llama_token_data layout");
+static_assert(sizeof(LlamaTokenDataArrayRaw) == 32, "llama_token_data_array layout");
+using fn_llama_sampler_init_grammar_t = void* (*)(const void*, const char*, const char*);
+using fn_llama_sampler_apply_t = void (*)(void*, LlamaTokenDataArrayRaw*);
+using fn_llama_sampler_accept_t = void (*)(void*, int32_t);
+using fn_llama_sampler_clone_t = void* (*)(const void*);
+// libllama-common, library patch 0010: JSON schema text -> GBNF text
+using fn_common_json_schema_to_grammar_c_t = int32_t (*)(const char*, char*, int32_t, char*, int32_t);
 using fn_llama_set_sampler_t = bool (*)(void*, int32_t, void*);
 using fn_llama_get_sampled_token_ith_t = int32_t (*)(void*, int32_t);
 using fn_llama_model_load_from_file_t = void* (*)(const char*, LlamaModelParamsOpaque);
@@ -1211,6 +1253,7 @@ using fn_llama_memory_seq_rm_t = bool (*)(void*, int32_t, int32_t, int32_t);
 using fn_llama_memory_seq_cp_t = void (*)(void*, int32_t, int32_t, int32_t, int32_t);
 using fn_llama_n_rs_seq_t = uint32_t (*)(const void*);
 using fn_llama_model_memory_size_t = uint64_t (*)(const void*, uint32_t, uint32_t, uint32_t);
+using fn_llama_model_set_draft_vocab_t = int32_t (*)(void*, const int32_t*, int32_t);
 using fn_llama_model_n_embd_t = int32_t (*)(const void*);
 using fn_llama_model_rope_type_t = int32_t (*)(const void*);
 using fn_llama_model_n_layer_nextn_t = int32_t (*)(const void*);
@@ -1369,6 +1412,7 @@ struct LlamaCppBackend::Impl {
     std::vector<StreamState> streams = std::vector<StreamState>(1);
     uint32_t n_streams = 1;
     static uint32_t& tls_stream() noexcept { static thread_local uint32_t s = 0; return s; }
+    static bool& tls_background() noexcept { static thread_local bool b = false; return b; }
     uint32_t cur_stream() const noexcept { const uint32_t s = tls_stream(); return (s < streams.size()) ? s : 0u; }
     StreamState& S() noexcept { return streams[cur_stream()]; }
     const StreamState& S() const noexcept { return streams[cur_stream()]; }
@@ -1406,6 +1450,7 @@ struct LlamaCppBackend::Impl {
     // into one weight read per run of consecutive ids. Without this a new request raced ~30 re-queueing streams for
     // the lock and waited many passes (32 streams: 6 of 32 absent per pass on average, 2-10 runs per pass).
     uint32_t excl_waiting = 0;
+    uint32_t fg_waiting = 0;     // of those, requests that are not background work
     double last_pass_ms = 0.0;   // duration of the last shared pass (rendezvous window scale)
     uint32_t n_generating = 0;
     std::vector<BatchOp*> pending;
@@ -1415,7 +1460,14 @@ struct LlamaCppBackend::Impl {
         const auto me = std::this_thread::get_id();
         if (gpu_busy && gpu_owner == me) { ++gpu_depth; return; }
         ++excl_waiting;
-        q_cv.wait(lk, [&] { return !gpu_busy; });
+        if (tls_background()) {
+            // background work lets every waiting interactive request have the device first
+            q_cv.wait(lk, [&] { return !gpu_busy && fg_waiting == 0; });
+        } else {
+            ++fg_waiting;
+            q_cv.wait(lk, [&] { return !gpu_busy; });
+            --fg_waiting;
+        }
         --excl_waiting;
         gpu_busy = true; gpu_owner = me; gpu_depth = 1;
     }
@@ -1448,12 +1500,16 @@ struct LlamaCppBackend::Impl {
             // hundred ms): let it in before the next chunk of this prefill
             q_cv.wait_for(lk, std::chrono::seconds(2), [&] { return excl_waiting == 0 && !gpu_busy; });
         }
-        const auto slice = std::chrono::milliseconds(std::clamp<int64_t>(static_cast<int64_t>(chunk_rows) * 3 / 2, 50, 2000));
+        // a background load gives the generating streams four times its own chunk time instead of as much again
+        const int64_t share = tls_background() ? 6 : 3;
+        const auto slice = std::chrono::milliseconds(
+            std::clamp<int64_t>(static_cast<int64_t>(chunk_rows) * share / (tls_background() ? 1 : 2), 50, 4000));
         if (n_generating > 0) {
             q_cv.wait_for(lk, slice, [&] { return n_generating == 0; });
         }
-        // not between a draft pass and its verify pass: a leader that is gathering ops goes first
-        q_cv.wait(lk, [&] { return !gpu_busy && !leader_active; });
+        // not between a draft pass and its verify pass: a leader that is gathering ops goes first; and a
+        // background load does not take the device back while an interactive request waits for it
+        q_cv.wait(lk, [&] { return !gpu_busy && !leader_active && (!tls_background() || fg_waiting == 0); });
         gpu_busy = true; gpu_owner = std::this_thread::get_id(); gpu_depth = depth;
     }
     // Prefill chunk for the next decode: large chunks are the fastest (Thor: 2048 rows run at ~940 tok/s through
@@ -1549,6 +1605,7 @@ struct LlamaCppBackend::Impl {
     RuntimeTelemetry telemetry{};
 
     fn_llama_backend_init_t llama_backend_init = nullptr;
+    fn_llama_log_set_t llama_log_set = nullptr;      // optional: libraries packed before 1.0.0-rc3 do not export it
     fn_llama_model_default_params_t llama_model_default_params = nullptr;
     fn_llama_context_default_params_t llama_context_default_params = nullptr;
     fn_llama_sampler_chain_default_params_t llama_sampler_chain_default_params = nullptr;
@@ -1556,6 +1613,37 @@ struct LlamaCppBackend::Impl {
     fn_llama_sampler_chain_add_t llama_sampler_chain_add = nullptr;
     fn_llama_sampler_init_greedy_t llama_sampler_init_greedy = nullptr;
     fn_llama_sampler_free_t llama_sampler_free = nullptr;
+    fn_llama_sampler_init_grammar_t llama_sampler_init_grammar = nullptr;
+    fn_llama_sampler_apply_t llama_sampler_apply = nullptr;
+    fn_llama_sampler_accept_t llama_sampler_accept = nullptr;
+    fn_llama_sampler_clone_t llama_sampler_clone = nullptr;
+    fn_common_json_schema_to_grammar_c_t common_json_schema_to_grammar_c = nullptr;
+    void* common_handle = nullptr;   // libllama-common.so next to libllama.so (optional)
+    // Image input: libmtmd through the flat entry points of library patch 0012 (tools/mtmd/sixi-mtmd.cpp)
+    void* (*sixi_mtmd_init)(const char*, const void*, int32_t, int32_t, int32_t, char*, int32_t) = nullptr;
+    void (*sixi_mtmd_free)(void*) = nullptr;
+    void* (*sixi_mtmd_image_load)(void*, const unsigned char*, size_t, char*, int32_t) = nullptr;
+    void (*sixi_mtmd_image_free)(void*) = nullptr;
+    int32_t (*sixi_mtmd_image_n_tokens)(const void*) = nullptr;
+    int32_t (*sixi_mtmd_image_n_pos)(const void*) = nullptr;
+    int32_t (*sixi_mtmd_image_text)(const void*, int32_t, int32_t*, int32_t) = nullptr;
+    int32_t (*sixi_mtmd_image_eval)(void*, void*, void*, int32_t, int32_t, int32_t, int32_t*) = nullptr;
+    void* mtmd_ctx = nullptr;
+    struct ImageEntry {
+        void* img = nullptr;
+        int32_t n_tokens = 0;            // rows the image writes to the context memory
+        int32_t n_pos = 0;               // positions it advances the sequence by (= length of its run of image tokens)
+        std::vector<int32_t> before;     // the model's image brackets
+        std::vector<int32_t> after;
+        uint64_t last_use = 0;
+    };
+    std::mutex image_mu;                 // the registry, and every call into libmtmd (it is not thread-safe)
+    std::unordered_map<int32_t, ImageEntry> images;
+    uint64_t image_clock = 0;
+    int32_t image_fill_token = -1;       // what an image token is replaced by if it ever reaches a token batch
+    int32_t model_token(int32_t t) const noexcept {
+        return IBackend::is_image_token(t) ? image_fill_token : t;
+    }
     fn_llama_set_sampler_t llama_set_sampler = nullptr;
     fn_llama_get_sampled_token_ith_t llama_get_sampled_token_ith = nullptr;
     fn_llama_model_load_from_file_t llama_model_load_from_file = nullptr;
@@ -1578,6 +1666,8 @@ struct LlamaCppBackend::Impl {
     fn_llama_memory_seq_cp_t llama_memory_seq_cp = nullptr;
     fn_llama_n_rs_seq_t llama_n_rs_seq = nullptr;
     fn_llama_model_memory_size_t llama_model_memory_size = nullptr;   // optional (sixi patch 0005)
+    fn_llama_model_set_draft_vocab_t llama_model_set_draft_vocab = nullptr;   // optional (sixi patch 0009)
+    std::vector<int32_t> mtp_draft_ids;   // draft vocabulary of the external MTP head: sampled index -> token id (empty = whole vocabulary)
     fn_llama_model_n_embd_t llama_model_n_embd = nullptr;
     fn_llama_model_rope_type_t llama_model_rope_type = nullptr;
     fn_llama_model_n_layer_nextn_t llama_model_n_layer_nextn = nullptr;
@@ -1855,7 +1945,9 @@ struct LlamaCppBackend::Impl {
         return pos;
     }
 
-    void record_target_h_nextn_and_dflash(int32_t count, size_t batch_pos_start) {
+    // row_offset: first row of the last decode to take (0 for a text batch; an image hands over the last rows of
+    // its embeddings, one per position it occupies)
+    void record_target_h_nextn_and_dflash(int32_t count, size_t batch_pos_start, size_t row_offset = 0) {
         if (count <= 0) {
             return;
         }
@@ -1866,6 +1958,7 @@ struct LlamaCppBackend::Impl {
             const float* h_tgt = llama_get_embeddings_nextn(ctx);
             if (h_tgt != nullptr) {
                 const size_t n_floats = static_cast<size_t>(count) * static_cast<size_t>(n_embd);
+                h_tgt += row_offset * static_cast<size_t>(n_embd);
                 history_h_nextn.insert(history_h_nextn.end(), h_tgt, h_tgt + n_floats);
 
                 // P0.1: Quantize latest token's hidden state row [n_embd] into 40-byte q8_1_fp32_block
@@ -1908,7 +2001,7 @@ struct LlamaCppBackend::Impl {
                 for (int32_t i = 0; i < count; ++i) {
                     float* dst = features_buf.data() + static_cast<size_t>(i) * n_embd_dflash_enc +
                                  static_cast<size_t>(k) * n_embd_tgt;
-                    const float* src = layer_inp + static_cast<size_t>(i) * n_embd_tgt;
+                    const float* src = layer_inp + (row_offset + static_cast<size_t>(i)) * n_embd_tgt;
                     std::memcpy(dst, src, static_cast<size_t>(n_embd_tgt) * sizeof(float));
                 }
             }
@@ -2059,6 +2152,9 @@ void LlamaCppBackend::Impl::exec_verify_group(std::vector<BatchOp*>& grp) {
                 seq_ptr[sp.off + j] = &seq_vals[si];
                 flags[sp.off + j] = (j < sp.real) ? 1 : 0;
             }
+        }
+        for (int32_t& t : tok) {
+            t = model_token(t);   // an image token proposed by a context drafter is not a model token
         }
         prefetch_ple_for_chunk(tok.data(), static_cast<int32_t>(total));
 
@@ -2359,21 +2455,38 @@ Status LlamaCppBackend::load_model(const LoadOptions& opts) {
     impl_->offload_controller = memory::AdaptiveOffloadController(opts.mode, opts.initial_offload_alpha);
     impl_->telemetry.adaptive_offload_alpha = impl_->offload_controller.current_alpha();
 
-    // Library resolution order: SIXI_LLAMA_LIB_PATH, the pinned upstream build (scripts/build_llamacpp.sh),
-    // the legacy unsloth build, then the ollama library (legacy ABI, speculative paths disabled).
+    // Library resolution order: SIXI_LLAMA_LIB_PATH, the library shipped next to the program in a binary release
+    // (<program dir>/../lib), the build `sixi setup` makes ($SIXI_HOME/llama.cpp, default ~/.sixi), the older
+    // location of the same pinned build (~/.unsloth/llama.cpp-pinned), the legacy unsloth build, then the ollama
+    // library (legacy ABI, speculative paths disabled).
     const char* home_env = std::getenv("HOME");
     const std::filesystem::path home_dir(home_env != nullptr ? home_env : "/root");
     std::string lib_path = (home_dir / ".unsloth" / "llama.cpp" / "build" / "bin" / "libllama.so").string();
+    bool pinned_build = false;   // a build of the pinned commit with patches/llama.cpp (scripts/build_llamacpp.sh)
     {
-        const std::filesystem::path pinned = home_dir / ".unsloth" / "llama.cpp-pinned" / "build" / "bin" / "libllama.so";
-        if (std::filesystem::exists(pinned)) {
-            lib_path = pinned.string();
+        const char* sixi_home = std::getenv("SIXI_HOME");
+        const std::filesystem::path sixi_dir =
+            (sixi_home != nullptr && sixi_home[0] != '\0') ? std::filesystem::path(sixi_home) : home_dir / ".sixi";
+        std::error_code exe_ec;
+        const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", exe_ec);
+        const std::filesystem::path shipped =
+            exe_ec ? std::filesystem::path() : exe.parent_path().parent_path() / "lib" / "libllama.so";
+        for (const std::filesystem::path& cand : {shipped,
+                                                  sixi_dir / "llama.cpp" / "build" / "bin" / "libllama.so",
+                                                  home_dir / ".unsloth" / "llama.cpp-pinned" / "build" / "bin" / "libllama.so"}) {
+            if (cand.empty()) {
+                continue;
+            }
+            if (std::filesystem::exists(cand)) {
+                lib_path = cand.string();
+                pinned_build = true;
+                break;
+            }
         }
     }
     if (const char* env_lib = std::getenv("SIXI_LLAMA_LIB_PATH"); env_lib != nullptr && env_lib[0] != '\0') {
         lib_path = env_lib;
-    } else if (file_contains_qwen4exp(opts.model_path) &&
-               lib_path.find("llama.cpp-pinned") == std::string::npos &&
+    } else if (file_contains_qwen4exp(opts.model_path) && !pinned_build &&
                std::filesystem::exists("/usr/local/lib/ollama/libllama.so.0.8.0")) {
         lib_path = "/usr/local/lib/ollama/libllama.so.0.8.0";
     } else if (!std::filesystem::exists(lib_path) &&
@@ -2382,24 +2495,42 @@ Status LlamaCppBackend::load_model(const LoadOptions& opts) {
     }
 
     const std::filesystem::path lib_dir = std::filesystem::path(lib_path).parent_path();
-    const char* companion_libs[] = {
-        "libgomp.so.1",
-        "libggml-base.so.0",
-        "libggml-cpu.so.0",
-        "libggml-cuda.so.0",
-        "libggml.so.0"
-    };
+    // Companion libraries of a shared llama.cpp build, opened first so that their symbols are global. The soname
+    // suffix follows the llama.cpp version (.so.0 before v1.0.0, .so.1 from it), so the plain name is tried first.
+    // A binary release ships one library that contains them all: none of these files exists then, and the device
+    // registry is looked up in the library itself (below).
+    const char* companion_libs[] = {"libgomp.so.1", "libggml-base", "libggml-cpu", "libggml-cuda", "libggml"};
     void* ggml_handle = nullptr;
     for (const char* dep : companion_libs) {
-        const std::filesystem::path dep_path = lib_dir / dep;
-        if (std::filesystem::exists(dep_path)) {
+        const bool versioned = std::strstr(dep, ".so") != nullptr;
+        for (const char* suffix : {".so", ".so.1", ".so.0"}) {
+            const std::filesystem::path dep_path = lib_dir / (versioned ? std::string(dep) : std::string(dep) + suffix);
+            if (!std::filesystem::exists(dep_path)) {
+                if (versioned) {
+                    break;
+                }
+                continue;
+            }
             void* h = dlopen(dep_path.c_str(), RTLD_LAZY | RTLD_GLOBAL);
             if (h != nullptr) {
                 impl_->dep_handles.push_back(h);
-                if (std::strcmp(dep, "libggml.so.0") == 0) {
+                if (std::strcmp(dep, "libggml") == 0) {
                     ggml_handle = h;
                 }
             }
+            break;
+        }
+    }
+    bool ggml_is_main_lib = false;
+    if (ggml_handle == nullptr) {
+        // single-library build: the registry functions are exported by the main library
+        void* h = dlopen(lib_path.c_str(), RTLD_LAZY | RTLD_GLOBAL);
+        if (h != nullptr && dlsym(h, "ggml_backend_dev_count") != nullptr) {
+            impl_->dep_handles.push_back(h);
+            ggml_handle = h;
+            ggml_is_main_lib = true;
+        } else if (h != nullptr) {
+            dlclose(h);
         }
     }
 
@@ -2407,7 +2538,7 @@ Status LlamaCppBackend::load_model(const LoadOptions& opts) {
     if (ggml_handle != nullptr) {
         auto load_all = reinterpret_cast<fn_ggml_backend_load_all_from_path_t>(
             dlsym(ggml_handle, "ggml_backend_load_all_from_path"));
-        if (load_all != nullptr) {
+        if (load_all != nullptr && !ggml_is_main_lib) {
             const std::filesystem::path cuda13_dir = lib_dir / "cuda_v13";
             if (std::filesystem::exists(cuda13_dir)) {
                 load_all(cuda13_dir.c_str());
@@ -2480,6 +2611,24 @@ Status LlamaCppBackend::load_model(const LoadOptions& opts) {
     (void)resolve(impl_->llama_sampler_chain_add, "llama_sampler_chain_add");
     (void)resolve(impl_->llama_sampler_init_greedy, "llama_sampler_init_greedy");
     (void)resolve(impl_->llama_sampler_free, "llama_sampler_free");
+    (void)resolve(impl_->llama_sampler_init_grammar, "llama_sampler_init_grammar");
+    (void)resolve(impl_->llama_sampler_apply, "llama_sampler_apply");
+    (void)resolve(impl_->llama_sampler_accept, "llama_sampler_accept");
+    (void)resolve(impl_->llama_sampler_clone, "llama_sampler_clone");
+    // JSON schema converter: lives in libllama-common (library patch 0010 adds the C entry); optional
+    for (const char* common_name : {"libllama-common.so", "libllama-common.so.1", "libllama-common.so.0"}) {
+        const std::filesystem::path common_path = lib_dir / common_name;
+        if (impl_->common_handle == nullptr && std::filesystem::exists(common_path)) {
+            impl_->common_handle = dlopen(common_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+        }
+    }
+    if (impl_->common_handle != nullptr) {
+        impl_->common_json_schema_to_grammar_c = reinterpret_cast<fn_common_json_schema_to_grammar_c_t>(
+            dlsym(impl_->common_handle, "common_json_schema_to_grammar_c"));
+    } else {
+        // single-library build: the converter is in the main library
+        (void)resolve(impl_->common_json_schema_to_grammar_c, "common_json_schema_to_grammar_c");
+    }
     (void)resolve(impl_->llama_set_sampler, "llama_set_sampler");
     (void)resolve(impl_->llama_get_sampled_token_ith, "llama_get_sampled_token_ith");
     (void)resolve(impl_->llama_vocab_mask, "llama_vocab_mask");
@@ -2488,6 +2637,7 @@ Status LlamaCppBackend::load_model(const LoadOptions& opts) {
     (void)resolve(impl_->llama_memory_seq_cp, "llama_memory_seq_cp");
     (void)resolve(impl_->llama_n_rs_seq, "llama_n_rs_seq");
     (void)resolve(impl_->llama_model_memory_size, "llama_model_memory_size");
+    (void)resolve(impl_->llama_model_set_draft_vocab, "llama_model_set_draft_vocab");
     (void)resolve(impl_->llama_model_n_embd, "llama_model_n_embd");
     (void)resolve(impl_->llama_model_rope_type, "llama_model_rope_type");
     (void)resolve(impl_->llama_model_n_layer_nextn, "llama_model_n_layer_nextn");
@@ -2521,6 +2671,13 @@ Status LlamaCppBackend::load_model(const LoadOptions& opts) {
         (void)resolve(impl_->llama_get_embeddings_nextn_ith, "_Z30llama_get_embeddings_nextn_ithP13llama_contexti");
     }
 
+    (void)resolve(impl_->llama_log_set, "llama_log_set");
+    if (impl_->llama_log_set != nullptr) {
+        const char* lv = std::getenv("SIXI_LLAMA_LOG");
+        const std::string_view want = lv != nullptr ? std::string_view(lv) : std::string_view();
+        g_llama_log_min_level = want == "debug" ? 1 : want == "warn" ? 3 : want == "error" ? 4 : 2;
+        impl_->llama_log_set(&sixi_llama_log, nullptr);
+    }
     impl_->llama_backend_init();
 
     // P0.4: Strongly-typed C ABI initialization + runtime canary verification
@@ -2553,13 +2710,32 @@ Status LlamaCppBackend::load_model(const LoadOptions& opts) {
         (impl_->llama_set_embeddings_nextn != nullptr) &&
         (impl_->llama_get_embeddings_nextn != nullptr) &&
         (impl_->llama_get_embeddings_nextn_ith != nullptr);
-    if (can_load_mtp) {
+    if (can_load_mtp && !opts.vocab_only) {
         SIXI_MODEL_SET(mparams, load_mtp, true);
+    }
+    if (opts.vocab_only) {
+        if (!impl_->telemetry.abi_canary_verified) {
+            return Status::Error(ErrorCode::BackendError, "vocab_only needs a library whose parameter layout is known");
+        }
+        SIXI_MODEL_SET(mparams, vocab_only, true);
+        SIXI_MODEL_SET(mparams, n_gpu_layers, 0);
     }
 
     impl_->model = impl_->llama_model_load_from_file(opts.model_path.c_str(), mparams);
     if (impl_->model == nullptr) {
         return Status::Error(ErrorCode::BackendError, "llama_model_load_from_file failed for " + opts.model_path);
+    }
+    if (opts.vocab_only) {
+        // Tokenizer only: no context, no streams. tokenize / detokenize / grammar constraints work.
+        impl_->vocab = impl_->llama_model_get_vocab(impl_->model);
+        if (impl_->vocab == nullptr) {
+            impl_->cleanup();
+            return Status::Error(ErrorCode::BackendError, "llama_model_get_vocab returned null");
+        }
+        const int32_t n_tok = impl_->llama_vocab_n_tokens(impl_->vocab);
+        impl_->n_vocab = (n_tok > 0) ? static_cast<uint64_t>(n_tok) : 0ULL;
+        impl_->eos_id = impl_->llama_vocab_eos(impl_->vocab);
+        return Status::Ok();
     }
 
     LlamaContextParamsOpaque cparams = cparams_default;
@@ -2826,6 +3002,33 @@ Status LlamaCppBackend::load_model(const LoadOptions& opts) {
             impl_->llama_model_free(impl_->model_mtp);
             impl_->model_mtp = nullptr;
         } else {
+            // Draft vocabulary: the head multiplies by the listed rows of its output matrix only. Needs the GPU
+            // greedy sampler (the head's logits are indexed by position in the list).
+            std::string dv_path = opts.mtp_draft_vocab_path;
+            if (dv_path.empty()) {
+                if (const char* e = std::getenv("SIXI_MTP_DRAFT_VOCAB"); e != nullptr) dv_path = e;
+            }
+            if (!dv_path.empty()) {
+                std::vector<int32_t> ids;
+                if (std::ifstream in(dv_path); in) {
+                    for (long long v = 0; in >> v;) {
+                        if (v >= 0 && v <= INT32_MAX) ids.push_back(static_cast<int32_t>(v));   // the library checks the range
+                    }
+                }
+                std::sort(ids.begin(), ids.end());
+                ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+                if (ids.empty() || impl_->llama_model_set_draft_vocab == nullptr ||
+                    impl_->llama_sampler_init_greedy == nullptr || impl_->llama_get_sampled_token_ith == nullptr) {
+                    std::fprintf(stderr, "sixi-asi: draft vocabulary %s not used (%s)\n", dv_path.c_str(),
+                                 ids.empty() ? "no token ids read" : "the library has no draft-vocabulary support");
+                } else if (impl_->llama_model_set_draft_vocab(impl_->model_mtp, ids.data(), static_cast<int32_t>(ids.size())) ==
+                           static_cast<int32_t>(ids.size())) {
+                    impl_->mtp_draft_ids = std::move(ids);
+                    std::fprintf(stderr, "sixi-asi: MTP draft vocabulary: %zu tokens (%s)\n", impl_->mtp_draft_ids.size(), dv_path.c_str());
+                } else {
+                    std::fprintf(stderr, "sixi-asi: draft vocabulary %s rejected by the library; whole vocabulary\n", dv_path.c_str());
+                }
+            }
             init_mtp_context(impl_->model_mtp, /*external=*/true);
             if (impl_->ctx_mtp == nullptr) {
                 impl_->llama_model_free(impl_->model_mtp);
@@ -3010,7 +3213,115 @@ Status LlamaCppBackend::load_model(const LoadOptions& opts) {
         }
     }
 
+    if (!opts.mmproj_path.empty()) {
+        // Image input: libmtmd next to libllama (or inside it, in a single-library build)
+        void* h = nullptr;
+        for (const char* name : {"libmtmd.so", "libmtmd.so.1", "libmtmd.so.0"}) {
+            const std::filesystem::path p = lib_dir / name;
+            if (h == nullptr && std::filesystem::exists(p)) {
+                h = dlopen(p.c_str(), RTLD_LAZY | RTLD_LOCAL);
+            }
+        }
+        if (h == nullptr) {
+            h = impl_->lib_handle;
+        } else {
+            impl_->dep_handles.push_back(h);
+        }
+        impl_->sixi_mtmd_init = reinterpret_cast<decltype(impl_->sixi_mtmd_init)>(dlsym(h, "sixi_mtmd_init"));
+        impl_->sixi_mtmd_free = reinterpret_cast<decltype(impl_->sixi_mtmd_free)>(dlsym(h, "sixi_mtmd_free"));
+        impl_->sixi_mtmd_image_load = reinterpret_cast<decltype(impl_->sixi_mtmd_image_load)>(dlsym(h, "sixi_mtmd_image_load"));
+        impl_->sixi_mtmd_image_free = reinterpret_cast<decltype(impl_->sixi_mtmd_image_free)>(dlsym(h, "sixi_mtmd_image_free"));
+        impl_->sixi_mtmd_image_n_tokens = reinterpret_cast<decltype(impl_->sixi_mtmd_image_n_tokens)>(dlsym(h, "sixi_mtmd_image_n_tokens"));
+        impl_->sixi_mtmd_image_n_pos = reinterpret_cast<decltype(impl_->sixi_mtmd_image_n_pos)>(dlsym(h, "sixi_mtmd_image_n_pos"));
+        impl_->sixi_mtmd_image_text = reinterpret_cast<decltype(impl_->sixi_mtmd_image_text)>(dlsym(h, "sixi_mtmd_image_text"));
+        impl_->sixi_mtmd_image_eval = reinterpret_cast<decltype(impl_->sixi_mtmd_image_eval)>(dlsym(h, "sixi_mtmd_image_eval"));
+        if (impl_->sixi_mtmd_init == nullptr || impl_->sixi_mtmd_free == nullptr || impl_->sixi_mtmd_image_load == nullptr ||
+            impl_->sixi_mtmd_image_free == nullptr || impl_->sixi_mtmd_image_n_tokens == nullptr ||
+            impl_->sixi_mtmd_image_n_pos == nullptr || impl_->sixi_mtmd_image_text == nullptr ||
+            impl_->sixi_mtmd_image_eval == nullptr) {
+            return Status::Error(ErrorCode::BackendError,
+                                 "this backend library has no image input (libmtmd with library patch 0012 next to libllama.so)");
+        }
+        char err[256] = {0};
+        impl_->mtmd_ctx = impl_->sixi_mtmd_init(
+            opts.mmproj_path.c_str(), impl_->model, 0, static_cast<int32_t>(opts.image_min_tokens),
+            static_cast<int32_t>(opts.image_max_tokens), err, static_cast<int32_t>(sizeof(err)));
+        if (impl_->mtmd_ctx == nullptr) {
+            return Status::Error(ErrorCode::BackendError, "projector " + opts.mmproj_path + ": " + err);
+        }
+        impl_->image_fill_token = eos_token_id();
+        auto pad = tokenize("<|image_pad|>", false);
+        if (pad.ok() && pad.value().size() == 1) {
+            impl_->image_fill_token = pad.value().front();
+        }
+    }
+
     return Status::Ok();
+}
+
+void LlamaCppBackend::set_background(bool background) noexcept {
+    Impl::tls_background() = background;
+}
+
+bool LlamaCppBackend::supports_images() const noexcept {
+    return impl_ && impl_->mtmd_ctx != nullptr;
+}
+
+Result<IBackend::ImageTokens> LlamaCppBackend::prepare_image(const std::string& file_bytes) {
+    if (!supports_images()) {
+        return Result<ImageTokens>(ErrorCode::InvalidArgument, "image input is off: the server was started without a projector (--mmproj)");
+    }
+    if (file_bytes.empty()) {
+        return Result<ImageTokens>(ErrorCode::InvalidArgument, "empty image");
+    }
+    uint64_t hash = 1469598103934665603ULL;   // FNV-1a over the file: the same file is the same image
+    for (unsigned char c : file_bytes) {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    const int32_t id = kImageTokenBase + static_cast<int32_t>(hash % 0x3FFFFFFFULL);
+
+    std::lock_guard<std::mutex> lk(impl_->image_mu);
+    auto it = impl_->images.find(id);
+    if (it == impl_->images.end()) {
+        char err[256] = {0};
+        void* img = impl_->sixi_mtmd_image_load(
+            impl_->mtmd_ctx, reinterpret_cast<const unsigned char*>(file_bytes.data()), file_bytes.size(), err,
+            static_cast<int32_t>(sizeof(err)));
+        if (img == nullptr) {
+            return Result<ImageTokens>(ErrorCode::InvalidArgument, std::string("image: ") + err);
+        }
+        Impl::ImageEntry e;
+        e.img = img;
+        e.n_tokens = impl_->sixi_mtmd_image_n_tokens(img);
+        e.n_pos = impl_->sixi_mtmd_image_n_pos(img);
+        for (int32_t which = 0; which < 2; ++which) {
+            std::vector<int32_t>& dst = which == 0 ? e.before : e.after;
+            int32_t buf[64];
+            const int32_t n = impl_->sixi_mtmd_image_text(img, which, buf, 64);
+            dst.assign(buf, buf + std::min<int32_t>(n, 64));
+        }
+        // Keep the registry small: an image that is dropped here is registered again by the next request that
+        // carries it, before anything needs to decode it.
+        while (impl_->images.size() >= 64) {
+            auto oldest = impl_->images.begin();
+            for (auto jt = impl_->images.begin(); jt != impl_->images.end(); ++jt) {
+                if (jt->second.last_use < oldest->second.last_use) {
+                    oldest = jt;
+                }
+            }
+            impl_->sixi_mtmd_image_free(oldest->second.img);
+            impl_->images.erase(oldest);
+        }
+        it = impl_->images.emplace(id, std::move(e)).first;
+    }
+    it->second.last_use = ++impl_->image_clock;
+    ImageTokens out;
+    out.tokens = it->second.before;
+    out.tokens.insert(out.tokens.end(), static_cast<size_t>(it->second.n_pos), id);
+    out.tokens.insert(out.tokens.end(), it->second.after.begin(), it->second.after.end());
+    out.extra_rows = it->second.n_tokens > it->second.n_pos ? static_cast<uint32_t>(it->second.n_tokens - it->second.n_pos) : 0u;
+    return Result<ImageTokens>(std::move(out));
 }
 
 bool LlamaCppBackend::is_loaded() const noexcept {
@@ -3108,7 +3419,7 @@ bool LlamaCppBackend::gpu_greedy_sampling_enabled() const noexcept {
 }
 
 Result<std::vector<int32_t>> LlamaCppBackend::tokenize(const std::string& text, bool add_bos) {
-    if (!is_loaded()) {
+    if (!impl_ || impl_->vocab == nullptr) {
         return Result<std::vector<int32_t>>(ErrorCode::BackendError, "LlamaCppBackend model is not loaded");
     }
     int32_t cap = static_cast<int32_t>(text.size()) + 16;
@@ -3141,12 +3452,15 @@ Result<std::vector<int32_t>> LlamaCppBackend::tokenize(const std::string& text, 
 }
 
 Result<std::string> LlamaCppBackend::detokenize(const std::vector<int32_t>& tokens) {
-    if (!is_loaded()) {
+    if (!impl_ || impl_->vocab == nullptr) {
         return Result<std::string>(ErrorCode::BackendError, "LlamaCppBackend model is not loaded");
     }
     std::string out;
     char buf[256];
     for (int32_t tok : tokens) {
+        if (IBackend::is_image_token(tok)) {
+            continue;   // an image has no text
+        }
         int32_t n = impl_->llama_token_to_piece(impl_->vocab, tok, buf, sizeof(buf), 0, true);
         if (n > 0 && static_cast<size_t>(n) <= sizeof(buf)) {
             out.append(buf, static_cast<size_t>(n));
@@ -3160,6 +3474,117 @@ Result<std::string> LlamaCppBackend::detokenize(const std::vector<int32_t>& toke
         }
     }
     return Result<std::string>(std::move(out));
+}
+
+namespace {
+
+// ITokenConstraint on the library's grammar sampler. One sampler per state; clone() copies it. The object must
+// not outlive the model whose vocabulary it was built for.
+class GrammarConstraint final : public ITokenConstraint {
+public:
+    struct Api {
+        fn_llama_sampler_apply_t apply = nullptr;
+        fn_llama_sampler_accept_t accept = nullptr;
+        fn_llama_sampler_clone_t clone = nullptr;
+        fn_llama_sampler_free_t free = nullptr;
+    };
+    GrammarConstraint(const Api& api, void* sampler) : api_(api), sampler_(sampler) {}
+    ~GrammarConstraint() override {
+        if (sampler_ != nullptr) {
+            api_.free(sampler_);
+        }
+    }
+    GrammarConstraint(const GrammarConstraint&) = delete;
+    GrammarConstraint& operator=(const GrammarConstraint&) = delete;
+
+    bool allows(int32_t token) override {
+        if (token < 0) {
+            return false;
+        }
+        LlamaTokenDataRaw one{token, 0.0f, 0.0f};
+        LlamaTokenDataArrayRaw arr{&one, 1, -1, false};
+        api_.apply(sampler_, &arr);
+        return arr.size == 1 && std::isfinite(arr.data[0].logit);
+    }
+
+    Status accept(int32_t token) override {
+        // The library throws on a token the grammar cannot take: never hand it one
+        if (!allows(token)) {
+            return Status::Error(ErrorCode::InvalidArgument, "token " + std::to_string(token) + " is refused by the grammar");
+        }
+        api_.accept(sampler_, token);
+        return Status::Ok();
+    }
+
+    Status mask_all(float* logits, uint64_t vocab_size) override {
+        scratch_.resize(vocab_size);
+        for (uint64_t i = 0; i < vocab_size; ++i) {
+            scratch_[i] = LlamaTokenDataRaw{static_cast<int32_t>(i), 0.0f, 0.0f};
+        }
+        LlamaTokenDataArrayRaw arr{scratch_.data(), scratch_.size(), -1, false};
+        api_.apply(sampler_, &arr);
+        for (size_t i = 0; i < arr.size; ++i) {
+            const LlamaTokenDataRaw& c = arr.data[i];
+            if (!std::isfinite(c.logit) && c.id >= 0 && static_cast<uint64_t>(c.id) < vocab_size) {
+                logits[c.id] = kMaskedLogit;
+            }
+        }
+        return Status::Ok();
+    }
+
+    std::unique_ptr<ITokenConstraint> clone() const override {
+        return std::make_unique<GrammarConstraint>(api_, api_.clone(sampler_));
+    }
+
+private:
+    Api api_;
+    void* sampler_ = nullptr;
+    std::vector<LlamaTokenDataRaw> scratch_;
+};
+
+}  // namespace
+
+Result<std::string> LlamaCppBackend::json_schema_to_grammar(const std::string& schema_json) {
+    if (!impl_ || impl_->common_json_schema_to_grammar_c == nullptr) {
+        return Result<std::string>(ErrorCode::BackendError,
+                                   "JSON schema converter not available (libllama-common.so with library patch 0010 next to libllama.so)");
+    }
+    char err[512] = {0};
+    const int32_t n = impl_->common_json_schema_to_grammar_c(schema_json.c_str(), nullptr, 0, err, static_cast<int32_t>(sizeof(err)));
+    if (n < 0) {
+        return Result<std::string>(ErrorCode::InvalidArgument, std::string("JSON schema: ") + err);
+    }
+    std::string out(static_cast<size_t>(n) + 1u, '\0');
+    const int32_t n2 = impl_->common_json_schema_to_grammar_c(schema_json.c_str(), out.data(), n + 1, err, static_cast<int32_t>(sizeof(err)));
+    if (n2 != n) {
+        return Result<std::string>(ErrorCode::BackendError, "JSON schema converter returned inconsistent sizes");
+    }
+    out.resize(static_cast<size_t>(n));
+    return Result<std::string>(std::move(out));
+}
+
+Result<std::unique_ptr<ITokenConstraint>> LlamaCppBackend::make_grammar_constraint(const std::string& gbnf, const std::string& root) {
+    using R = Result<std::unique_ptr<ITokenConstraint>>;
+    if (!impl_ || impl_->vocab == nullptr) {
+        return R(ErrorCode::BackendError, "LlamaCppBackend model is not loaded");
+    }
+    if (impl_->llama_sampler_init_grammar == nullptr || impl_->llama_sampler_apply == nullptr ||
+        impl_->llama_sampler_accept == nullptr || impl_->llama_sampler_clone == nullptr || impl_->llama_sampler_free == nullptr) {
+        return R(ErrorCode::BackendError, "the loaded library has no grammar sampler");
+    }
+    if (gbnf.empty()) {
+        return R(ErrorCode::InvalidArgument, "empty grammar");
+    }
+    void* sampler = impl_->llama_sampler_init_grammar(impl_->vocab, gbnf.c_str(), root.c_str());
+    if (sampler == nullptr) {
+        return R(ErrorCode::InvalidArgument, "the grammar does not parse (start symbol \"" + root + "\")");
+    }
+    GrammarConstraint::Api api;
+    api.apply = impl_->llama_sampler_apply;
+    api.accept = impl_->llama_sampler_accept;
+    api.clone = impl_->llama_sampler_clone;
+    api.free = impl_->llama_sampler_free;
+    return R(std::unique_ptr<ITokenConstraint>(std::make_unique<GrammarConstraint>(api, sampler)));
 }
 
 Status LlamaCppBackend::reset_state() {
@@ -3515,8 +3940,65 @@ Result<std::vector<float>> LlamaCppBackend::forward_tokens(
     std::vector<int32_t> mutable_tokens = input_tokens;
     std::vector<int8_t> zero_logits;
     for (size_t offset = 0, step = 0; offset < mutable_tokens.size(); offset += step) {
-        const int32_t count = static_cast<int32_t>(
-            std::min<size_t>(impl_->prefill_chunk_now(chunk_sz), mutable_tokens.size() - offset));
+        if (IBackend::is_image_token(mutable_tokens[offset])) {
+            // A run of image tokens: decode the image itself at these positions
+            const int32_t id = mutable_tokens[offset];
+            size_t run = 1;
+            while (offset + run < mutable_tokens.size() && mutable_tokens[offset + run] == id) {
+                ++run;
+            }
+            step = run;
+            if (offset + run >= mutable_tokens.size()) {
+                return Result<std::vector<float>>(ErrorCode::InvalidArgument, "a prompt cannot end with an image");
+            }
+            const size_t pos_before = impl_->S().history_tokens.size();
+            int32_t n_rows = 0;
+            {
+                std::lock_guard<std::mutex> lk(impl_->image_mu);
+                auto it = impl_->images.find(id);
+                if (it == impl_->images.end() || impl_->mtmd_ctx == nullptr) {
+                    return Result<std::vector<float>>(ErrorCode::BackendError, "image is not registered with the backend");
+                }
+                if (static_cast<size_t>(it->second.n_pos) != run) {
+                    return Result<std::vector<float>>(ErrorCode::BackendError, "image run does not match the image's positions");
+                }
+                it->second.last_use = ++impl_->image_clock;
+                n_rows = it->second.n_tokens;
+                int32_t new_past = 0;
+                const auto t0 = std::chrono::steady_clock::now();
+                const int32_t rc = impl_->sixi_mtmd_image_eval(
+                    impl_->mtmd_ctx, it->second.img, impl_->ctx, static_cast<int32_t>(pos_before), impl_->seq(),
+                    static_cast<int32_t>(max_batch), &new_past);
+                if (rc != 0 || new_past != static_cast<int32_t>(pos_before + run)) {
+                    return Result<std::vector<float>>(
+                        ErrorCode::BackendError, "image decode failed (code " + std::to_string(rc) + ", position " +
+                                                     std::to_string(new_past) + ")");
+                }
+                if (Impl::trace_prefill()) {
+                    std::fprintf(stderr, "sixi-asi: image pos=%zu positions=%zu rows=%d ms=%.1f\n", pos_before, run, n_rows,
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                }
+            }
+            impl_->S().history_tokens.insert(impl_->S().history_tokens.end(), run, id);
+            // The drafter gets one row per position: the last rows of the image's last decode. They only steer
+            // drafts (every drafted token is verified), so an approximation here cannot change an answer.
+            const size_t last_rows = (static_cast<size_t>(n_rows) % max_batch == 0)
+                                         ? std::min<size_t>(static_cast<size_t>(n_rows), max_batch)
+                                         : static_cast<size_t>(n_rows) % max_batch;
+            if (last_rows >= run) {
+                impl_->record_target_h_nextn_and_dflash(static_cast<int32_t>(run), pos_before, last_rows - run);
+            }
+            impl_->gpu_yield(static_cast<int32_t>(run));
+            continue;
+        }
+        size_t text_left = mutable_tokens.size() - offset;
+        for (size_t i = 1; i < text_left; ++i) {
+            if (IBackend::is_image_token(mutable_tokens[offset + i])) {
+                text_left = i;   // the text chunk ends where the next image starts
+                break;
+            }
+        }
+        const int32_t count = static_cast<int32_t>(std::min<size_t>(impl_->prefill_chunk_now(chunk_sz), text_left));
         step = static_cast<size_t>(count);
         const size_t pos_before = impl_->S().history_tokens.size();
         const bool is_last_chunk = (offset + static_cast<size_t>(count) >= mutable_tokens.size());
@@ -3659,6 +4141,9 @@ Result<std::vector<std::vector<float>>> LlamaCppBackend::forward_sequence_all_lo
 
     const uint32_t max_batch = (impl_->opts.n_batch > 0) ? impl_->opts.n_batch : 512u;
     std::vector<int32_t> mutable_tokens = input_tokens;
+    for (int32_t& t : mutable_tokens) {
+        t = impl_->model_token(t);
+    }
     std::vector<std::vector<float>> all_logits;
     all_logits.reserve(input_tokens.size());
 
@@ -3789,6 +4274,9 @@ Result<int32_t> LlamaCppBackend::forward_tokens_greedy(
     const uint32_t chunk_sz = (prefill_chunk_size == 0) ? max_batch : std::min(prefill_chunk_size, max_batch);
 
     std::vector<int32_t> mutable_tokens = input_tokens;
+    for (int32_t& t : mutable_tokens) {
+        t = impl_->model_token(t);
+    }
     std::vector<int8_t> zero_logits;
     for (size_t offset = 0, step = 0; offset < mutable_tokens.size(); offset += step) {
         const int32_t count = static_cast<int32_t>(
@@ -3870,6 +4358,9 @@ Result<std::vector<int32_t>> LlamaCppBackend::forward_sequence_greedy_argmax(
 
     const uint32_t max_batch = (impl_->opts.n_batch > 0) ? impl_->opts.n_batch : 512u;
     std::vector<int32_t> mutable_tokens = input_tokens;
+    for (int32_t& t : mutable_tokens) {
+        t = impl_->model_token(t);
+    }
     std::vector<int32_t> sampled_tokens;
     sampled_tokens.reserve(input_tokens.size());
 
@@ -4316,9 +4807,17 @@ Result<std::vector<int32_t>> LlamaCppBackend::draft_embedded_mtp(int32_t first_t
     auto sample_mtp_greedy = [&]() -> int32_t {
         if (impl_->mtp_sampler_chain != nullptr && impl_->llama_get_sampled_token_ith != nullptr) {
             const int32_t sampled = impl_->llama_get_sampled_token_ith(impl_->ctx_mtp, -1);
+            if (!impl_->mtp_draft_ids.empty()) {
+                // index into the draft vocabulary; there are no whole-vocabulary logits to fall back to
+                return (sampled >= 0 && static_cast<size_t>(sampled) < impl_->mtp_draft_ids.size())
+                    ? impl_->mtp_draft_ids[static_cast<size_t>(sampled)] : -1;
+            }
             if (sampled >= 0) {
                 return sampled;
             }
+        }
+        if (!impl_->mtp_draft_ids.empty()) {
+            return -1;
         }
         const float* raw_logits = impl_->llama_get_logits_ith(impl_->ctx_mtp, -1);
         if (raw_logits == nullptr) {

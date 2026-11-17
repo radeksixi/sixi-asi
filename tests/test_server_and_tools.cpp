@@ -543,6 +543,285 @@ bool test_prefix_cache_device_slots() {
     return true;
 }
 
+// Reference backend with a synthetic grammar engine: every "schema" asks for a run of decimal digits (at least
+// four) and nothing else. The reference tokenizer is one token per byte (id = byte + 3), so the constraint is
+// visible in the answer text.
+class DigitsConstraint final : public sixi_asi::core::ITokenConstraint {
+public:
+    explicit DigitsConstraint(uint32_t n = 0) : n_(n) {}
+    bool allows(int32_t token) override {
+        const bool digit = token >= '0' + 3 && token <= '9' + 3;
+        return digit || (token == 2 && n_ >= 4);   // token 2: end of generation
+    }
+    sixi_asi::Status accept(int32_t token) override {
+        if (!allows(token)) {
+            return sixi_asi::Status::Error(sixi_asi::ErrorCode::InvalidArgument, "refused");
+        }
+        ++n_;
+        return sixi_asi::Status::Ok();
+    }
+    sixi_asi::Status mask_all(float* logits, uint64_t vocab_size) override {
+        for (uint64_t i = 0; i < vocab_size; ++i) {
+            if (!allows(static_cast<int32_t>(i))) {
+                logits[i] = sixi_asi::core::kMaskedLogit;
+            }
+        }
+        return sixi_asi::Status::Ok();
+    }
+    std::unique_ptr<sixi_asi::core::ITokenConstraint> clone() const override { return std::make_unique<DigitsConstraint>(n_); }
+
+private:
+    uint32_t n_;
+};
+
+// "[" three digits "]" and then nothing: a document with an end, for the stop-at-the-closing-bracket rule.
+class BracketConstraint final : public sixi_asi::core::ITokenConstraint {
+public:
+    explicit BracketConstraint(uint32_t n = 0) : n_(n) {}
+    bool allows(int32_t token) override {
+        if (n_ == 0) return token == '[' + 3;
+        if (n_ <= 3) return token >= '0' + 3 && token <= '9' + 3;
+        if (n_ == 4) return token == ']' + 3;
+        return token == 2;   // end of generation
+    }
+    sixi_asi::Status accept(int32_t token) override {
+        if (!allows(token)) {
+            return sixi_asi::Status::Error(sixi_asi::ErrorCode::InvalidArgument, "refused");
+        }
+        ++n_;
+        return sixi_asi::Status::Ok();
+    }
+    sixi_asi::Status mask_all(float* logits, uint64_t vocab_size) override {
+        for (uint64_t i = 0; i < vocab_size; ++i) {
+            if (!allows(static_cast<int32_t>(i))) {
+                logits[i] = sixi_asi::core::kMaskedLogit;
+            }
+        }
+        return sixi_asi::Status::Ok();
+    }
+    std::unique_ptr<sixi_asi::core::ITokenConstraint> clone() const override { return std::make_unique<BracketConstraint>(n_); }
+
+private:
+    uint32_t n_;
+};
+
+class DigitsGrammarBackend final : public sixi_asi::core::ReferenceHybridBackend {
+public:
+    using ReferenceHybridBackend::ReferenceHybridBackend;
+    sixi_asi::Result<std::string> json_schema_to_grammar(const std::string& schema_json) override {
+        if (schema_json.find("unsupported") != std::string::npos) {
+            return sixi_asi::Result<std::string>(sixi_asi::ErrorCode::InvalidArgument, "JSON schema: not expressible as a grammar");
+        }
+        if (schema_json.find("\"array\"") != std::string::npos) {
+            return sixi_asi::Result<std::string>(std::string("root ::= \"[\" [0-9] [0-9] [0-9] \"]\""));
+        }
+        return sixi_asi::Result<std::string>(std::string("root ::= [0-9]+"));
+    }
+    sixi_asi::Result<std::unique_ptr<sixi_asi::core::ITokenConstraint>> make_grammar_constraint(const std::string& gbnf, const std::string&) override {
+        std::unique_ptr<sixi_asi::core::ITokenConstraint> c;
+        if (gbnf.find("\"[\"") != std::string::npos) {
+            c = std::make_unique<BracketConstraint>();
+        } else {
+            c = std::make_unique<DigitsConstraint>();
+        }
+        return sixi_asi::Result<std::unique_ptr<sixi_asi::core::ITokenConstraint>>(std::move(c));
+    }
+};
+
+bool all_digits(const std::string& text) {
+    return !text.empty() && text.find_first_not_of("0123456789") == std::string::npos;
+}
+
+bool test_response_format_constrained_answer() {
+    using namespace sixi_asi;
+    using namespace sixi_asi::core;
+    using namespace sixi_asi::server;
+
+    ReferenceHybridBackend::Config bcfg;
+    bcfg.vocab_size = 256;
+    bcfg.hidden_size = 64;
+    bcfg.n_layers = 2;
+    bcfg.n_experts = 8;
+    bcfg.top_k = 2;
+    bcfg.enable_fast_rollback_ring = true;
+    bcfg.rollback_ring = 8;
+    bcfg.device_snapshot_slots = 2;
+    auto backend = std::make_shared<DigitsGrammarBackend>(bcfg);
+
+    ServerConfig scfg;
+    scfg.bind_host = "127.0.0.1";
+    scfg.port = 0;
+    scfg.manifest.model_name = "ref";
+    scfg.admission.admitted = true;
+    scfg.n_ctx = 4096;
+    SixiServer server(scfg, backend);
+
+    ChatCompletionRequest req;
+    req.messages.push_back(ChatMessage{});
+    req.messages.back().role = "user";
+    req.messages.back().content = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
+    req.budgets.max_tokens = 24;
+    req.enable_thinking = false;
+
+    // Free text first: the reference model does not write digits by itself
+    auto free1 = server.handle_chat_completion(req);
+    SIXI_ASSERT(free1.ok());
+    SIXI_ASSERT(!free1->constrained);
+    SIXI_ASSERT(!all_digits(free1->content));
+
+    // Constrained: digits only, on the same prompt (restored from the prefix cache), and the model's own choices
+    // were overruled on the way
+    ChatCompletionRequest creq = req;
+    creq.response_schema_json = R"({"type":"string","pattern":"^[0-9]+$"})";
+    auto c1 = server.handle_chat_completion(creq);
+    SIXI_ASSERT(c1.ok());
+    SIXI_ASSERT(c1->constrained);
+    SIXI_ASSERT(all_digits(c1->content));
+    SIXI_ASSERT(c1->content.size() >= 4);
+    SIXI_ASSERT(c1->constraint_rows_changed > 0);
+    SIXI_ASSERT(c1->finish_reason == "stop" || c1->finish_reason == "length");
+
+    // Deterministic, and it leaves nothing behind for the next free request on the same backend
+    auto c2 = server.handle_chat_completion(creq);
+    SIXI_ASSERT(c2.ok() && c2->content == c1->content);
+    auto free2 = server.handle_chat_completion(req);
+    SIXI_ASSERT(free2.ok());
+    SIXI_ASSERT(!free2->constrained);
+    SIXI_ASSERT(free2->content == free1->content);
+
+    // Sampled decoding stays inside the constraint as well
+    ChatCompletionRequest sreq = creq;
+    sreq.sampling.temperature = 0.9f;
+    sreq.sampling.seed = 11;
+    auto s1 = server.handle_chat_completion(sreq);
+    SIXI_ASSERT(s1.ok() && all_digits(s1->content));
+
+    // A document with an end: generation stops at the closing bracket (no step spent on the end token), a
+    // document that closes exactly on the last allowed token is "stop", one that does not fit is "length"
+    {
+        ChatCompletionRequest breq = req;
+        breq.response_schema_json = R"({"type":"array","items":{"type":"integer"}})";
+        breq.budgets.max_tokens = 50;
+        auto b1 = server.handle_chat_completion(breq);
+        SIXI_ASSERT(b1.ok());
+        SIXI_ASSERT(b1->content.size() == 5 && b1->content.front() == '[' && b1->content.back() == ']');
+        SIXI_ASSERT(all_digits(b1->content.substr(1, 3)));
+        SIXI_ASSERT(b1->finish_reason == "stop");
+        SIXI_ASSERT(b1->completion_tokens == 5);
+        breq.budgets.max_tokens = 5;
+        auto b2 = server.handle_chat_completion(breq);
+        SIXI_ASSERT(b2.ok() && b2->content == b1->content && b2->finish_reason == "stop");
+        breq.budgets.max_tokens = 4;
+        auto b3 = server.handle_chat_completion(breq);
+        SIXI_ASSERT(b3.ok() && b3->content == b1->content.substr(0, 4) && b3->finish_reason == "length");
+    }
+
+    // A schema the converter refuses fails the request; so does a backend without a grammar engine, and
+    // reasoning with a tokenizer whose </think> is several tokens
+    ChatCompletionRequest bad = creq;
+    bad.response_schema_json = R"({"type":"unsupported"})";
+    SIXI_ASSERT(server.handle_chat_completion(bad).code() == ErrorCode::InvalidArgument);
+    ChatCompletionRequest thinking = creq;
+    thinking.enable_thinking = true;
+    auto th = server.handle_chat_completion(thinking);
+    SIXI_ASSERT(th.ok() ? all_digits(th->content) : th.code() == ErrorCode::InvalidArgument);
+    {
+        SixiServer plain(scfg, std::make_shared<ReferenceHybridBackend>(bcfg));
+        SIXI_ASSERT(!plain.handle_chat_completion(creq).ok());
+    }
+
+    // The same through HTTP: response_format is parsed, malformed variants are 400
+    auto port_res = server.start();
+    SIXI_ASSERT(port_res.ok());
+    const int port = port_res.value();
+    const std::string head = R"({"messages": [{"role": "user", "content": "Hello SIXI"}], "max_tokens": 16, "enable_thinking": false, )";
+    {
+        HttpResponse r = send_http_request(port, "POST", "/v1/chat/completions",
+            head + R"("response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "string"}}}})");
+        SIXI_ASSERT(r.status_code == 200);
+        SIXI_ASSERT(r.body.find("\"constrained\":true") != std::string::npos);
+        const size_t at = r.body.find("\"content\":\"");
+        SIXI_ASSERT(at != std::string::npos);
+        const size_t from = at + 11;
+        SIXI_ASSERT(all_digits(r.body.substr(from, r.body.find('"', from) - from)));
+    }
+    {
+        HttpResponse r = send_http_request(port, "POST", "/v1/chat/completions", head + R"("response_format": {"type": "json_object"}})");
+        SIXI_ASSERT(r.status_code == 200 && r.body.find("\"constrained\":true") != std::string::npos);
+        HttpResponse t = send_http_request(port, "POST", "/v1/chat/completions", head + R"("response_format": {"type": "text"}})");
+        SIXI_ASSERT(t.status_code == 200 && t.body.find("\"constrained\":false") != std::string::npos);
+    }
+    for (const char* tail : {
+             R"("response_format": {"type": "xml"}})",
+             R"("response_format": {"type": "json_schema"}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": "text"}}})",
+             R"("response_format": "json"})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "unsupported"}}}})",
+             R"("response_format": {"type": "json_object"}, "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]})",
+             // schema features the converter would skip without a word: refused with the reason instead
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "integer", "multipleOf": 5}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"not": {"type": "string"}}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "string", "format": "email"}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "number", "minimum": 0.5}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "object", "minProperties": 2}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "object", "properties": {"a": {"type": "string", "frobnicate": 1}}}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a", "b"]}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "array", "items": {"$ref": "#/$defs/x", "minLength": 2}, "$defs": {"x": {"type": "string"}}}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "array", "items": false}}}})"}) {
+        HttpResponse r = send_http_request(port, "POST", "/v1/chat/completions", head + tail);
+        if (r.status_code != 400) {
+            std::cerr << "  expected 400 for " << tail << ", got " << r.status_code << "\n";
+        }
+        SIXI_ASSERT(r.status_code == 400);
+    }
+    // Streaming: a schema that cannot be honoured is a 400 before the stream starts, not an event inside it;
+    // a good one streams the constrained answer
+    {
+        HttpResponse bad = send_http_request(port, "POST", "/v1/chat/completions",
+            head + R"("stream": true, "response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "integer", "multipleOf": 5}}}})");
+        SIXI_ASSERT(bad.status_code == 400);
+        SIXI_ASSERT(bad.body.find("multipleOf") != std::string::npos);
+        HttpResponse bad2 = send_http_request(port, "POST", "/v1/chat/completions",
+            head + R"("stream": true, "response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "unsupported"}}}})");
+        SIXI_ASSERT(bad2.status_code == 400);
+        HttpResponse good = send_http_request(port, "POST", "/v1/chat/completions",
+            head + R"("stream": true, "response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "string"}}}})");
+        SIXI_ASSERT(good.status_code == 200);
+        SIXI_ASSERT(good.body.find("data: [DONE]") != std::string::npos);
+        SIXI_ASSERT(good.body.find("\"error\"") == std::string::npos);
+        SIXI_ASSERT(good.body.find("\"constrained\":true") != std::string::npos);
+    }
+
+    // The reason is in the body, with the place in the schema
+    {
+        HttpResponse r = send_http_request(port, "POST", "/v1/chat/completions",
+            head + R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "object", "properties": {"a": {"type": "string", "frobnicate": 1}}}}}})");
+        SIXI_ASSERT(r.status_code == 400);
+        SIXI_ASSERT(r.body.find("frobnicate") != std::string::npos && r.body.find("#/properties/a") != std::string::npos);
+    }
+    // The shapes the requesting agent uses are accepted: flat objects with required strings, arrays of objects,
+    // string enums, arrays of integers, additionalProperties false; "name" and "strict" beside the schema
+    for (const char* tail : {
+             R"("response_format": {"type": "json_schema", "json_schema": {"name": "u", "strict": true, "schema": {"type": "object", "properties": {"utterance": {"type": "string"}}, "required": ["utterance"], "additionalProperties": false}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"name": "l", "strict": true, "schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string", "enum": ["a", "b", "c"]}, "ids": {"type": "array", "items": {"type": "integer"}}}, "required": ["label", "ids"], "additionalProperties": false}}}, "required": ["items"], "additionalProperties": false, "title": "t", "description": "d"}}}})",
+             // the remaining supported features, as the gate script uses them
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "object", "properties": {"nick": {"type": ["string", "null"]}, "v": {"anyOf": [{"type": "integer"}, {"type": "string"}]}, "k": {"const": "event"}, "e": {"enum": ["a", 1, null]}, "r": {"type": "integer", "minimum": 1, "maximum": 5}, "x": {"type": "integer", "exclusiveMinimum": 0}}, "required": ["nick", "v"]}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}], "minItems": 2, "maxItems": 2}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "object", "properties": {"d": {"type": "string", "format": "date"}, "u": {"type": "string", "format": "uuid"}, "p": {"type": "string", "pattern": "^[A-Z]{2} [0-9]{4}$"}, "c": {"type": "string", "minLength": 3, "maxLength": 3}}, "required": ["d"], "additionalProperties": {"type": "integer"}}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"$defs": {"node": {"type": "object", "properties": {"name": {"type": "string"}, "children": {"type": "array", "items": {"$ref": "#/$defs/node"}, "maxItems": 3}}, "required": ["name", "children"], "additionalProperties": false}}, "$ref": "#/$defs/node"}}}})",
+             R"("response_format": {"type": "json_schema", "json_schema": {"schema": {"allOf": [{"type": "object", "properties": {"a": {"type": "string"}}}, {"type": "object", "properties": {"b": {"type": "integer"}}}]}}}})"}) {
+        HttpResponse r = send_http_request(port, "POST", "/v1/chat/completions", head + tail);
+        if (r.status_code != 200) {
+            std::cerr << "  expected 200 for " << tail << ", got " << r.status_code << ": " << r.body << "\n";
+        }
+        SIXI_ASSERT(r.status_code == 200);
+    }
+    server.stop();
+    return true;
+}
+
 bool test_sixi_asi_server_http_sse_cancellation_concurrency_and_admission() {
     using namespace sixi_asi;
     using namespace sixi_asi::core;
@@ -719,6 +998,7 @@ int main() {
     RUN_TEST(test_loop_detector_and_budget_tracker);
     RUN_TEST(test_qwen38_template_and_function_call_syntax);
     RUN_TEST(test_prefix_cache_device_slots);
+    RUN_TEST(test_response_format_constrained_answer);
     RUN_TEST(test_sixi_asi_server_http_sse_cancellation_concurrency_and_admission);
 
     std::cout << "Summary: " << passed << " passed, " << failed << " failed\n";

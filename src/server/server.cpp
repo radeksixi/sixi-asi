@@ -1,4 +1,6 @@
 #include "sixi_asi/server.hpp"
+#include "sixi_asi/constraint.hpp"
+#include <cstring>
 #include <regex>
 #include "sixi_asi/numeric.hpp"
 
@@ -1162,7 +1164,65 @@ Result<RenderedPrompt> render_chat_prompt(
 
 namespace {
 
-std::string content_parts_to_text(const ojson& content) {
+// JSON for a client. Generated text can end in the middle of a UTF-8 sequence (a token limit, or a character that
+// spans two tokens): such bytes become U+FFFD instead of an exception that would take the server down.
+template <typename J>
+std::string client_json(const J& j) {
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+// Length of the longest prefix of `s` that does not end inside a UTF-8 sequence.
+size_t utf8_whole_prefix(const std::string& s) {
+    size_t n = s.size();
+    size_t back = 0;
+    while (back < 4 && back < n && (static_cast<unsigned char>(s[n - 1 - back]) & 0xC0u) == 0x80u) {
+        ++back;   // continuation bytes at the end
+    }
+    if (back >= n) {
+        return back == 4 ? n : 0;   // only continuation bytes: nothing to wait for after four of them
+    }
+    const unsigned char lead = static_cast<unsigned char>(s[n - 1 - back]);
+    size_t need = 0;
+    if ((lead & 0x80u) == 0x00u) need = 1;
+    else if ((lead & 0xE0u) == 0xC0u) need = 2;
+    else if ((lead & 0xF0u) == 0xE0u) need = 3;
+    else if ((lead & 0xF8u) == 0xF0u) need = 4;
+    else return n;   // not a lead byte: malformed, pass it on
+    return (back + 1 >= need) ? n : n - 1 - back;
+}
+
+// Where an image stands in a message's text until the prompt is tokenized: \x1d SIXIIMG <index> \x1d
+constexpr char kImageMarkerOpen[] = "\x1dSIXIIMG";
+constexpr char kImageMarkerClose = '\x1d';
+
+bool base64_decode(const std::string& in, std::string& out) {
+    out.clear();
+    out.reserve(in.size() * 3 / 4);
+    uint32_t acc = 0;
+    int bits = 0;
+    for (unsigned char c : in) {
+        int v;
+        if (c >= 'A' && c <= 'Z') v = c - 'A';
+        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') v = c - '0' + 52;
+        else if (c == '+' || c == '-') v = 62;
+        else if (c == '/' || c == '_') v = 63;
+        else if (c == '=' || c == '\n' || c == '\r' || c == ' ') continue;
+        else return false;
+        acc = (acc << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((acc >> bits) & 0xFFu));
+        }
+    }
+    return !out.empty();
+}
+
+// Text of a message's content. Parts are joined without a separator, as llama-server does. An `image_url` part
+// with a data: URI is decoded into `images` and leaves a marker in the text; without `images` (or on a bad part)
+// `err` says why.
+std::string content_parts_to_text(const ojson& content, std::vector<std::string>* images = nullptr, std::string* err = nullptr) {
     if (content.is_string()) {
         return content.get<std::string>();
     }
@@ -1171,6 +1231,31 @@ std::string content_parts_to_text(const ojson& content) {
         for (const auto& part : content) {
             if (part.is_string()) {
                 out += part.get<std::string>();
+            } else if (part.is_object() && part.value("type", "") == "image_url") {
+                std::string url;
+                if (part.contains("image_url") && part["image_url"].is_object() && part["image_url"].contains("url") &&
+                    part["image_url"]["url"].is_string()) {
+                    url = part["image_url"]["url"].get<std::string>();
+                } else if (part.contains("image_url") && part["image_url"].is_string()) {
+                    url = part["image_url"].get<std::string>();
+                }
+                const size_t comma = url.find(',');
+                std::string bytes;
+                if (url.rfind("data:", 0) != 0 || comma == std::string::npos || url.find(";base64") == std::string::npos ||
+                    url.find(";base64") > comma || !base64_decode(url.substr(comma + 1), bytes)) {
+                    if (err != nullptr) {
+                        *err = "image_url must be a data: URI with base64 content (data:image/jpeg;base64,...); remote URLs are not fetched";
+                    }
+                    return {};
+                }
+                if (images == nullptr) {
+                    if (err != nullptr) {
+                        *err = "images are accepted in messages only";
+                    }
+                    return {};
+                }
+                out += kImageMarkerOpen + std::to_string(images->size()) + kImageMarkerClose;
+                images->push_back(std::move(bytes));
             } else if (part.is_object() && part.contains("text") && part["text"].is_string()) {
                 out += part["text"].get<std::string>();
             }
@@ -1178,6 +1263,15 @@ std::string content_parts_to_text(const ojson& content) {
         return out;
     }
     return {};
+}
+
+// A reused prefix of `keep` tokens must not end inside an image: the image is decoded whole or not at all.
+size_t image_safe_keep(const std::vector<int32_t>& tokens, size_t keep) {
+    while (keep > 0 && keep < tokens.size() && core::IBackend::is_image_token(tokens[keep]) &&
+           tokens[keep - 1] == tokens[keep]) {
+        --keep;
+    }
+    return keep;
 }
 
 ToolDefinition tool_definition_from_json(const ojson& fn_obj) {
@@ -1254,6 +1348,118 @@ ToolDefinition tool_definition_from_json(const ojson& fn_obj) {
     return td;
 }
 
+// JSON schema features the grammar converter enforces (the library reads exactly these keywords). Everything else
+// is refused with the reason: a keyword the converter would skip must not turn into a looser answer than the
+// caller asked for. Returns the reason, or nothing when the schema is fully supported.
+std::optional<std::string> unsupported_schema_feature(const ojson& s, const std::string& path) {
+    static const std::set<std::string> kEnforced = {
+        "type", "properties", "required", "additionalProperties", "items", "prefixItems", "minItems", "maxItems",
+        "enum", "const", "anyOf", "allOf", "$ref", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+        "minLength", "maxLength", "pattern", "format"};
+    static const std::set<std::string> kAnnotations = {
+        "title", "description", "default", "examples", "$schema", "$id", "$comment", "deprecated", "readOnly",
+        "writeOnly", "$defs", "definitions"};
+    static const std::set<std::string> kFormats = {"date", "time", "date-time", "uuid", "uuid1", "uuid2", "uuid3", "uuid4", "uuid5"};
+    static const std::set<std::string> kTypes = {"null", "boolean", "number", "integer", "string", "array", "object"};
+
+    if (!s.is_object()) {
+        return path + ": a schema must be an object";
+    }
+    for (auto it = s.begin(); it != s.end(); ++it) {
+        const std::string& k = it.key();
+        if (k == "oneOf") {
+            return path + ": 'oneOf' is not supported (use 'anyOf')";
+        }
+        if (kEnforced.count(k) == 0 && kAnnotations.count(k) == 0) {
+            return path + ": keyword '" + k + "' is not supported";
+        }
+    }
+    bool integer_only = false;
+    if (s.contains("type")) {
+        const ojson& t = s["type"];
+        auto known = [&](const ojson& v) { return v.is_string() && kTypes.count(v.get<std::string>()) != 0; };
+        if (t.is_string() && known(t)) {
+            integer_only = t.get<std::string>() == "integer";
+        } else if (t.is_array() && !t.empty() && std::all_of(t.begin(), t.end(), known)) {
+            integer_only = t.size() == 1 && t[0].get<std::string>() == "integer";
+        } else {
+            return path + ": 'type' must be one of the seven JSON types, or a list of them";
+        }
+    }
+    for (const char* bound : {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"}) {
+        if (s.contains(bound) && !integer_only) {
+            return path + ": '" + bound + "' is supported for \"type\": \"integer\" only";
+        }
+    }
+    if (s.contains("format") && (!s["format"].is_string() || kFormats.count(s["format"].get<std::string>()) == 0)) {
+        return path + ": 'format' " + s["format"].dump() + " is not supported (date, time, date-time, uuid)";
+    }
+    for (const char* comb : {"$ref", "anyOf"}) {
+        if (!s.contains(comb)) {
+            continue;
+        }
+        for (auto it = s.begin(); it != s.end(); ++it) {
+            if (it.key() != comb && kEnforced.count(it.key()) != 0) {
+                return path + ": '" + it.key() + "' next to '" + comb + "' is not supported";
+            }
+        }
+    }
+    if (s.contains("required")) {
+        const ojson& req = s["required"];
+        if (!req.is_array()) {
+            return path + ": 'required' must be a list";
+        }
+        for (const auto& r : req) {
+            if (!r.is_string() || !s.contains("properties") || !s["properties"].is_object() ||
+                !s["properties"].contains(r.get<std::string>())) {
+                return path + ": required key " + r.dump() + " is not in 'properties'";
+            }
+        }
+    }
+    auto each_in = [&](const char* key, bool object_of_schemas) -> std::optional<std::string> {
+        if (!s.contains(key)) {
+            return std::nullopt;
+        }
+        const ojson& v = s[key];
+        if (object_of_schemas ? !v.is_object() : !v.is_array()) {
+            return path + ": '" + key + "' must be " + (object_of_schemas ? "an object" : "a list");
+        }
+        size_t i = 0;
+        for (auto it = v.begin(); it != v.end(); ++it, ++i) {
+            const std::string sub = path + "/" + key + "/" + (object_of_schemas ? it.key() : std::to_string(i));
+            if (auto why = unsupported_schema_feature(*it, sub)) {
+                return why;
+            }
+        }
+        return std::nullopt;
+    };
+    for (const char* key : {"properties", "$defs", "definitions"}) {
+        if (auto why = each_in(key, true)) {
+            return why;
+        }
+    }
+    for (const char* key : {"prefixItems", "anyOf", "allOf"}) {
+        if (auto why = each_in(key, false)) {
+            return why;
+        }
+    }
+    if (s.contains("items")) {
+        if (s["items"].is_array()) {
+            if (auto why = each_in("items", false)) {
+                return why;
+            }
+        } else if (auto why = unsupported_schema_feature(s["items"], path + "/items")) {
+            return why;
+        }
+    }
+    if (s.contains("additionalProperties") && !s["additionalProperties"].is_boolean()) {
+        if (auto why = unsupported_schema_feature(s["additionalProperties"], path + "/additionalProperties")) {
+            return why;
+        }
+    }
+    return std::nullopt;
+}
+
 // OpenAI-compatible request body -> ChatCompletionRequest. Type errors become InvalidArgument (HTTP 400).
 Status parse_chat_request(const ojson& j, const std::string& default_model, uint64_t seq_id, ChatCompletionRequest& req) {
     try {
@@ -1266,6 +1472,13 @@ Status parse_chat_request(const ojson& j, const std::string& default_model, uint
         }
         req.model = (j.contains("model") && j["model"].is_string()) ? j["model"].get<std::string>() : default_model;
 
+        if (j.contains("priority")) {
+            if (!j["priority"].is_string() || (j["priority"] != "background" && j["priority"] != "interactive")) {
+                return Status::Error(ErrorCode::InvalidArgument, "priority must be \"interactive\" (default) or \"background\"");
+            }
+            req.background = j["priority"] == "background";
+        }
+
         if (j.contains("messages") && j["messages"].is_array()) {
             for (const auto& m : j["messages"]) {
                 if (!m.is_object()) {
@@ -1274,7 +1487,11 @@ Status parse_chat_request(const ojson& j, const std::string& default_model, uint
                 ChatMessage cm;
                 cm.role = (m.contains("role") && m["role"].is_string()) ? m["role"].get<std::string>() : "user";
                 if (m.contains("content")) {
-                    cm.content = content_parts_to_text(m["content"]);
+                    std::string content_err;
+                    cm.content = content_parts_to_text(m["content"], &req.images, &content_err);
+                    if (!content_err.empty()) {
+                        return Status::Error(ErrorCode::InvalidArgument, content_err);
+                    }
                 }
                 if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
                     cm.reasoning_content = m["reasoning_content"].get<std::string>();
@@ -1376,6 +1593,31 @@ Status parse_chat_request(const ojson& j, const std::string& default_model, uint
             }
         }
 
+        // response_format (OpenAI): {"type":"json_schema","json_schema":{"schema":{...}}} or {"type":"json_object"}
+        // (any object; llama-server's optional "schema" member is honoured too). "text" or absent: free text.
+        if (j.contains("response_format") && !j["response_format"].is_null()) {
+            const auto& rf = j["response_format"];
+            if (!rf.is_object()) {
+                return Status::Error(ErrorCode::InvalidArgument, "'response_format' must be an object");
+            }
+            const std::string type = (rf.contains("type") && rf["type"].is_string()) ? rf["type"].get<std::string>() : std::string();
+            if (type == "json_schema") {
+                if (!rf.contains("json_schema") || !rf["json_schema"].is_object() ||
+                    !rf["json_schema"].contains("schema") || !rf["json_schema"]["schema"].is_object()) {
+                    return Status::Error(ErrorCode::InvalidArgument,
+                                         "'response_format' of type json_schema needs json_schema.schema (an object)");
+                }
+                req.response_schema_json = rf["json_schema"]["schema"].dump();
+            } else if (type == "json_object") {
+                req.response_schema_json = (rf.contains("schema") && rf["schema"].is_object())
+                                               ? rf["schema"].dump()
+                                               : std::string("{\"type\":\"object\"}");
+            } else if (type != "text") {
+                return Status::Error(ErrorCode::InvalidArgument,
+                                     "'response_format.type' must be \"text\", \"json_object\" or \"json_schema\"");
+            }
+        }
+
         if (j.contains("tools") && j["tools"].is_array()) {
             for (const auto& t : j["tools"]) {
                 if (!t.is_object()) continue;
@@ -1386,6 +1628,11 @@ Status parse_chat_request(const ojson& j, const std::string& default_model, uint
                     req.tools_json.push_back(t.dump());
                 }
             }
+        }
+        if (!req.response_schema_json.empty() && !req.tools.empty()) {
+            // The grammar would refuse every tool call: say so instead of silently disabling the tools
+            return Status::Error(ErrorCode::InvalidArgument,
+                                 "'response_format' together with 'tools' is not supported yet: send one of them");
         }
     } catch (const std::exception& e) {
         return Status::Error(ErrorCode::InvalidArgument, std::string("Malformed request field: ") + e.what());
@@ -1408,6 +1655,7 @@ struct SixiServer::Impl {
     // Long prompt prefills run one after another (first come, first served) but outside backend_mutex, so that a
     // request whose prompt is already cached is not queued behind another agent's cold document load.
     std::mutex long_prefill_mutex;
+    std::atomic<uint32_t> interactive_waiting{0};   // interactive requests waiting for backend_mutex
     mutable std::mutex metrics_mutex;
 
     // Parallel streams (backend->stream_count() > 1): a request leases one backend stream for its lifetime.
@@ -1420,6 +1668,14 @@ struct SixiServer::Impl {
     std::atomic<uint64_t> request_seq{0};
     std::atomic<uint64_t> total_requests{0};
     std::atomic<uint64_t> active_requests{0};
+    // Requests a background request may run next to: the reserved slots stay free for interactive ones.
+    uint64_t slot_limit(bool background) const noexcept {
+        const uint64_t all = cfg.max_concurrent_requests;
+        if (!background || cfg.reserve_interactive == 0) {
+            return all;
+        }
+        return all > cfg.reserve_interactive ? all - cfg.reserve_interactive : 1u;
+    }
     std::atomic<uint64_t> completed_requests{0};
     std::atomic<uint64_t> cancelled_requests{0};
     std::atomic<uint64_t> admission_rejected_requests{0};
@@ -1438,6 +1694,7 @@ struct SixiServer::Impl {
     std::vector<core::BackendSequenceState> prefix_snapshots; // most recently used last (host copies; used when the
                                                                // backend has no device-side snapshot slots)
     std::vector<uint64_t> device_slot_last_use;               // LRU stamps for backend device snapshot slots
+    std::vector<uint8_t> device_slot_anchor;                  // 1: the slot holds the end of a long system prompt (see pick_slot)
     uint64_t device_slot_clock = 0;
     struct SlotLogits { std::vector<float> logits; int32_t greedy_token = -1; };
     std::vector<SlotLogits> device_slot_logits;               // post-prefill logits per slot: an identical prompt needs no forward at all
@@ -1680,7 +1937,7 @@ struct SixiServer::Impl {
             {"message", message}
         };
         res.status = status;
-        res.set_content(err.dump(), "application/json");
+        res.set_content(client_json(err), "application/json");
     }
 
     static int http_status_for(ErrorCode code) {
@@ -1734,7 +1991,7 @@ SixiServer::SixiServer(
         j["peak_ram_bytes"] = impl_->cfg.memory_plan.peak_host_ram_bytes;
         j["active_requests"] = impl_->active_requests.load(std::memory_order_relaxed);
         res.status = 200;
-        res.set_content(j.dump(), "application/json");
+        res.set_content(client_json(j), "application/json");
     });
 
     // GET /v1/models
@@ -1747,14 +2004,14 @@ SixiServer::SixiServer(
         model_obj["id"] = impl_->default_model_id();
         model_obj["object"] = "model";
         model_obj["recipe_hash"] = impl_->cfg.manifest.compute_recipe_hash();
-        model_obj["text_only"] = impl_->cfg.manifest.text_only;
+        model_obj["text_only"] = impl_->cfg.manifest.text_only && !impl_->backend->supports_images();
         model_obj["execution_mode"] = execution_mode_to_string(impl_->cfg.execution_mode);
 
         json j;
         j["object"] = "list";
         j["data"] = json::array({model_obj});
         res.status = 200;
-        res.set_content(j.dump(), "application/json");
+        res.set_content(client_json(j), "application/json");
     });
 
     // GET /metrics
@@ -1793,7 +2050,7 @@ SixiServer::SixiServer(
         j["peak_ram_bytes"] = m.peak_ram_bytes;
         j["peak_pinned_ram_bytes"] = m.peak_pinned_ram_bytes;
         res.status = 200;
-        res.set_content(j.dump(), "application/json");
+        res.set_content(client_json(j), "application/json");
     });
 
     // POST /apply-template : render the chat prompt exactly as /v1/chat/completions would (parity testing)
@@ -1826,7 +2083,7 @@ SixiServer::SixiServer(
         out["prompt"] = rp->text;
         out["opens_think_block"] = rp->opens_think_block;
         http_res.status = 200;
-        http_res.set_content(out.dump(), "application/json");
+        http_res.set_content(client_json(out), "application/json");
     });
 
     // POST /v1/chat/completions
@@ -1846,7 +2103,7 @@ SixiServer::SixiServer(
                 {"detailed_breakdown", impl_->cfg.admission.detailed_breakdown}
             };
             http_res.status = 503;
-            http_res.set_content(err.dump(), "application/json");
+            http_res.set_content(client_json(err), "application/json");
             return;
         }
 
@@ -1878,15 +2135,39 @@ SixiServer::SixiServer(
             return;
         }
 
+        if (chat_req.stream && !chat_req.response_schema_json.empty()) {
+            // A stream is committed to HTTP 200 once it starts: refuse a schema that cannot be honoured now, as a
+            // 400 like the non-streaming path, not as an error event inside the stream.
+            const ojson schema = ojson::parse(chat_req.response_schema_json, nullptr, false);
+            std::string why;
+            if (schema.is_discarded()) {
+                why = "not valid JSON";
+            } else if (auto feature = unsupported_schema_feature(schema, "#")) {
+                why = *feature;
+            } else if (auto gbnf = impl_->backend->json_schema_to_grammar(chat_req.response_schema_json);
+                       gbnf.code() == ErrorCode::InvalidArgument) {
+                why = gbnf.message();
+            }
+            if (!why.empty()) {
+                impl_->total_requests.fetch_add(1, std::memory_order_relaxed);
+                Impl::send_error(http_res, 400, ErrorCode::InvalidArgument,
+                                 why.rfind("JSON schema", 0) == 0 ? why : "JSON schema: " + why);
+                return;
+            }
+        }
+
         if (chat_req.stream) {
             // A client that sends its next request the moment the previous answer ends can arrive before that
             // request has released its slot (8 clients in lockstep: 8 finishing + 8 arriving). Give the slot a
             // moment before answering 429.
-            for (int waited_ms = 0; waited_ms < 250 &&
-                 impl_->active_requests.load(std::memory_order_acquire) >= impl_->cfg.max_concurrent_requests; ++waited_ms) {
+            // A background request waits for a slot instead of failing, and leaves the reserved ones alone.
+            const uint64_t slot_limit = impl_->slot_limit(chat_req.background);
+            const int wait_ms = chat_req.background ? 120000 : 250;
+            for (int waited_ms = 0; waited_ms < wait_ms &&
+                 impl_->active_requests.load(std::memory_order_acquire) >= slot_limit; ++waited_ms) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            if (impl_->active_requests.load(std::memory_order_acquire) >= impl_->cfg.max_concurrent_requests) {
+            if (impl_->active_requests.load(std::memory_order_acquire) >= slot_limit) {
                 impl_->total_requests.fetch_add(1, std::memory_order_relaxed);
                 impl_->admission_rejected_requests.fetch_add(1, std::memory_order_relaxed);
                 Impl::send_error(http_res, 429, ErrorCode::BackpressureRejected, "Max concurrent requests exceeded");
@@ -1920,7 +2201,7 @@ SixiServer::SixiServer(
                             {"code", error_code_to_string(res.code())},
                             {"message", res.message()}
                         };
-                        const std::string ev = "data: " + err.dump() + "\n\n";
+                        const std::string ev = "data: " + client_json(err) + "\n\n";
                         (void)sink.write(ev.data(), ev.size());
                     }
                     sink.done();
@@ -2012,7 +2293,7 @@ SixiServer::SixiServer(
                 {"detailed_breakdown", impl_->cfg.admission.detailed_breakdown}
             };
             http_res.status = Impl::http_status_for(res.code());
-            http_res.set_content(err.dump(), "application/json");
+            http_res.set_content(client_json(err), "application/json");
             return;
         }
 
@@ -2083,6 +2364,9 @@ SixiServer::SixiServer(
                 {"prefill_tok_per_s", cr.prefill_tok_per_s},
                 {"decode_tok_per_s", cr.decode_tok_per_s},
                 {"mean_acceptance_length", cr.mean_acceptance_length},
+                {"constrained", cr.constrained},
+                {"constraint_rows_changed", cr.constraint_rows_changed},
+                {"constraint_drafts_refused", cr.constraint_drafts_refused},
                 {"prefill_ms", cr.prefill_ms},
                 {"snapshot_ms", cr.snapshot_ms},
                 {"reasoning_forced_closed", cr.reasoning_forced_closed}
@@ -2114,7 +2398,7 @@ SixiServer::SixiServer(
         }
 
         http_res.status = 200;
-        http_res.set_content(out.dump(), "application/json");
+        http_res.set_content(client_json(out), "application/json");
     });
 }
 
@@ -2183,18 +2467,24 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
     }
 
     // Atomic compare-and-increment for max_concurrent_requests enforcement
+    const uint64_t slot_limit = impl_->slot_limit(req.background);
     uint64_t cur_active = impl_->active_requests.load(std::memory_order_acquire);
-    for (int waited_ms = 0; waited_ms < 250 && cur_active >= impl_->cfg.max_concurrent_requests; ++waited_ms) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));   // see the streaming pre-check: a slot being released
-        cur_active = impl_->active_requests.load(std::memory_order_acquire);
-    }
+    const int wait_budget_ms = req.background ? 120000 : 250;   // see the streaming pre-check: a slot being released
+    int waited_ms = 0;
     while (true) {
-        if (cur_active >= impl_->cfg.max_concurrent_requests) {
+        if (cur_active >= slot_limit && waited_ms < wait_budget_ms) {
+            // also after losing the race for a slot that had just come free
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            ++waited_ms;
+            cur_active = impl_->active_requests.load(std::memory_order_acquire);
+            continue;
+        }
+        if (cur_active >= slot_limit) {
             impl_->admission_rejected_requests.fetch_add(1, std::memory_order_relaxed);
             return Result<ChatCompletionResponse>(
                 ErrorCode::BackpressureRejected,
                 "Active requests reached max_concurrent_requests (" +
-                    std::to_string(impl_->cfg.max_concurrent_requests) + ")");
+                    std::to_string(slot_limit) + (req.background ? " for background requests)" : ")"));
         }
         if (impl_->active_requests.compare_exchange_weak(
                 cur_active, cur_active + 1,
@@ -2207,6 +2497,12 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
         std::atomic<uint64_t>& counter;
         ~ActiveGuard() { counter.fetch_sub(1, std::memory_order_release); }
     } active_guard{impl_->active_requests};
+    // Background work on this thread until the request ends: the backend lets interactive requests go first.
+    struct BackgroundGuard {
+        core::IBackend& b;
+        BackgroundGuard(core::IBackend& backend, bool on) : b(backend) { b.set_background(on); }
+        ~BackgroundGuard() { b.set_background(false); }
+    } background_guard{*impl_->backend, req.background};
 
     ChatCompletionResponse resp;
     const uint64_t seq_num = impl_->request_seq.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2248,28 +2544,128 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
         rp = std::move(rp_res.value());
     }
 
-    auto tok_res = impl_->backend->tokenize(rp.text, true);
-    if (!tok_res.ok()) {
-        return tok_res.status();
+    std::vector<int32_t> prompt_tokens;
+    uint32_t image_extra_rows = 0;   // context cells the images take beyond their positions
+    if (req.images.empty()) {
+        auto tok_res = impl_->backend->tokenize(rp.text, true);
+        if (!tok_res.ok()) {
+            return tok_res.status();
+        }
+        prompt_tokens = std::move(tok_res.value());
+    } else {
+        // The text between the image markers is tokenized piece by piece (as llama-server does) and each image
+        // contributes its own tokens: the model's image brackets around a run of image tokens.
+        if (!impl_->backend->supports_images()) {
+            return Result<ChatCompletionResponse>(
+                ErrorCode::InvalidArgument, "this server was started without a projector: images need --mmproj");
+        }
+        size_t at = 0;
+        bool first_piece = true;
+        auto add_text = [&](const std::string& piece) -> Status {
+            if (piece.empty()) {
+                return Status::Ok();
+            }
+            auto tok_res = impl_->backend->tokenize(piece, first_piece);
+            if (!tok_res.ok()) {
+                return tok_res.status();
+            }
+            first_piece = false;
+            prompt_tokens.insert(prompt_tokens.end(), tok_res.value().begin(), tok_res.value().end());
+            return Status::Ok();
+        };
+        size_t used = 0;
+        while (true) {
+            const size_t open = rp.text.find(kImageMarkerOpen, at);
+            if (open == std::string::npos) {
+                break;
+            }
+            const size_t num = open + sizeof(kImageMarkerOpen) - 1;
+            const size_t close = rp.text.find(kImageMarkerClose, num);
+            if (close == std::string::npos) {
+                break;
+            }
+            Status st = add_text(rp.text.substr(at, open - at));
+            if (!st.ok()) {
+                return st;
+            }
+            const size_t index = static_cast<size_t>(std::strtoul(rp.text.substr(num, close - num).c_str(), nullptr, 10));
+            if (index >= req.images.size()) {
+                return Result<ChatCompletionResponse>(ErrorCode::InvalidArgument, "image marker without an image");
+            }
+            auto img_res = impl_->backend->prepare_image(req.images[index]);
+            if (!img_res.ok()) {
+                return img_res.status();
+            }
+            prompt_tokens.insert(prompt_tokens.end(), img_res.value().tokens.begin(), img_res.value().tokens.end());
+            image_extra_rows += img_res.value().extra_rows;
+            first_piece = false;
+            ++used;
+            at = close + 1;
+        }
+        Status st = add_text(rp.text.substr(at));
+        if (!st.ok()) {
+            return st;
+        }
+        if (used != req.images.size()) {
+            return Result<ChatCompletionResponse>(
+                ErrorCode::InvalidArgument, "an image did not reach the prompt (images are supported in user and system messages)");
+        }
     }
-    std::vector<int32_t> prompt_tokens = std::move(tok_res.value());
     if (prompt_tokens.empty()) {
         return Result<ChatCompletionResponse>(ErrorCode::InvalidArgument, "Prompt tokenized to zero tokens");
     }
-    resp.prompt_tokens = static_cast<uint32_t>(prompt_tokens.size());
+    resp.prompt_tokens = static_cast<uint32_t>(prompt_tokens.size()) + image_extra_rows;
+
+    // Constrained answer (response_format): the grammar is built before any device work, so a schema that cannot
+    // be expressed fails the request at once instead of after the prefill.
+    std::unique_ptr<core::ITokenConstraint> answer_constraint;
+    int32_t constraint_start_token = -1;
+    if (!req.response_schema_json.empty()) {
+        const ojson schema = ojson::parse(req.response_schema_json, nullptr, false);
+        if (schema.is_discarded()) {
+            return Result<ChatCompletionResponse>(ErrorCode::InvalidArgument, "JSON schema: not valid JSON");
+        }
+        if (auto why = unsupported_schema_feature(schema, "#")) {
+            return Result<ChatCompletionResponse>(ErrorCode::InvalidArgument, "JSON schema: " + *why);
+        }
+        auto gbnf = impl_->backend->json_schema_to_grammar(req.response_schema_json);
+        if (!gbnf.ok()) {
+            return gbnf.status();
+        }
+        std::string grammar = gbnf.value();
+        std::string start_symbol = "root";
+        if (rp.opens_think_block) {
+            // Reasoning stays free: the grammar starts after the token that closes it. The newlines the template
+            // puts between </think> and the answer are allowed there (and dropped from the content).
+            auto close = impl_->backend->tokenize("</think>", false);
+            if (!close.ok() || close->size() != 1) {
+                return Result<ChatCompletionResponse>(
+                    ErrorCode::InvalidArgument,
+                    "'response_format' with reasoning needs a model whose </think> is a single token; send enable_thinking false");
+            }
+            constraint_start_token = close->front();
+            grammar += "\nsixi-root ::= [\\n]* root\n";
+            start_symbol = "sixi-root";
+        }
+        auto made = impl_->backend->make_grammar_constraint(grammar, start_symbol);
+        if (!made.ok()) {
+            return made.status();
+        }
+        answer_constraint = std::move(made.value());
+    }
     if (req.include_rendered_prompt) {
         resp.rendered_prompt = rp.text;
     }
 
     TokenBudgetConfig budgets = req.budgets;
     if (impl_->cfg.n_ctx > 0) {
-        if (prompt_tokens.size() >= impl_->cfg.n_ctx) {
+        if (prompt_tokens.size() + image_extra_rows >= impl_->cfg.n_ctx) {
             return Result<ChatCompletionResponse>(
                 ErrorCode::InvalidArgument,
-                "Prompt has " + std::to_string(prompt_tokens.size()) + " tokens but the context window is " +
+                "Prompt has " + std::to_string(prompt_tokens.size() + image_extra_rows) + " tokens but the context window is " +
                     std::to_string(impl_->cfg.n_ctx));
         }
-        const uint32_t room = impl_->cfg.n_ctx - static_cast<uint32_t>(prompt_tokens.size());
+        const uint32_t room = impl_->cfg.n_ctx - static_cast<uint32_t>(prompt_tokens.size()) - image_extra_rows;
         budgets.max_tokens = std::min<uint32_t>(budgets.max_tokens, room);
     }
 
@@ -2322,7 +2718,7 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             size_t lcp = 0;
             const size_t lim = std::min(hist.size(), prompt_tokens.size());
             while (lcp < lim && hist[lcp] == prompt_tokens[lcp]) ++lcp;
-            const size_t keep = std::min(lcp, prompt_tokens.size() - 1);
+            const size_t keep = image_safe_keep(prompt_tokens, std::min(lcp, prompt_tokens.size() - 1));
             if (keep > best_keep && hist.size() - keep <= window) {
                 best_keep = keep;
                 best = static_cast<int>(s);
@@ -2334,7 +2730,27 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
     StreamLease stream_lease{impl_.get(), stream_id};
     impl_->backend->bind_stream(stream_id);
 
-    std::unique_lock<std::mutex> backend_lock(impl_->backend_mutex);
+    // The request lock has no order of its own: an interactive request announces itself, and background requests
+    // let every announced one take the lock first.
+    auto lock_requests = [&](std::unique_lock<std::mutex>& lk) {
+        if (req.background) {
+            while (true) {
+                while (impl_->interactive_waiting.load(std::memory_order_acquire) > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                lk.lock();
+                if (impl_->interactive_waiting.load(std::memory_order_acquire) == 0) {
+                    return;
+                }
+                lk.unlock();
+            }
+        }
+        impl_->interactive_waiting.fetch_add(1, std::memory_order_acq_rel);
+        lk.lock();
+        impl_->interactive_waiting.fetch_sub(1, std::memory_order_acq_rel);
+    };
+    std::unique_lock<std::mutex> backend_lock(impl_->backend_mutex, std::defer_lock);
+    lock_requests(backend_lock);
     // One exclusive device section for the whole setup (released before the decode loop or on any early return)
     struct SetupSection {
         core::IBackend* b;
@@ -2343,7 +2759,8 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
         ~SetupSection() { end(); }
     } setup_section{impl_->backend.get(), n_streams > 1};
     if (setup_section.on) impl_->backend->begin_setup();
-    impl_->backend->set_gpu_greedy_sampling_enabled(greedy);
+    // A constrained answer needs the logits of every row on the host (the grammar picks among them)
+    impl_->backend->set_gpu_greedy_sampling_enabled(greedy && !answer_constraint);
 
     const auto t_start = std::chrono::steady_clock::now();
     std::vector<float> current_logits;
@@ -2365,27 +2782,66 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
         return num_st;
     };
 
-    // Saves the live backend state into the least recently used device slot (no logits kept: the slot is a
-    // mid-prompt checkpoint, a later request prefills from it).
-    auto save_checkpoint_slot = [&]() {
+    // Which slot a new prompt state replaces. Two kinds share the slots: anchors (the state at the end of a long
+    // system prompt, which every later call with that system prompt starts from) and tails (the end of one
+    // prompt, or a point shortly before it). Until 1.0.0-rc2 every call wrote up to three tails over the least
+    // recently used slots, so an agent with three roles, each with its own system prompt, never found a role's
+    // prompt again: 0% of 1,700 prompt tokens reused per call, 3.4 s a call alone and 16 s with five sessions.
+    // Tails replace tails; anchors may hold all slots but two and then replace the oldest anchor.
+    auto pick_slot = [&](bool anchor) -> int {
         const uint32_t n_slots = impl_->backend->device_snapshot_slots();
-        if (n_slots == 0) return;
         if (impl_->device_slot_last_use.size() < n_slots) impl_->device_slot_last_use.resize(n_slots, 0);
         if (impl_->device_slot_logits.size() < n_slots) impl_->device_slot_logits.resize(n_slots);
-        const std::vector<int32_t> live = impl_->backend->context_tokens();
+        if (impl_->device_slot_anchor.size() < n_slots) impl_->device_slot_anchor.resize(n_slots, 0);
+        const uint32_t max_anchors = n_slots > 2 ? n_slots - 2 : (n_slots > 1 ? 1u : 0u);
+        uint32_t anchors = 0;
+        for (uint32_t sidx = 0; sidx < n_slots; ++sidx) {
+            // an anchor nothing has started from for a long time is a tail again
+            if (impl_->device_slot_anchor[sidx] != 0 && impl_->device_slot_clock - impl_->device_slot_last_use[sidx] > 32ull * n_slots) {
+                impl_->device_slot_anchor[sidx] = 0;
+            }
+            anchors += impl_->device_slot_anchor[sidx];
+        }
+        if (anchor && max_anchors == 0) return -1;
+        const bool among_anchors = anchor && anchors >= max_anchors;
         int target = -1;
         uint64_t oldest = UINT64_MAX;
         for (uint32_t sidx = 0; sidx < n_slots; ++sidx) {
-            if (impl_->backend->device_snapshot_tokens(sidx) == live) return;
+            if ((impl_->device_slot_anchor[sidx] != 0) != among_anchors) continue;
             if (impl_->device_slot_last_use[sidx] < oldest) { oldest = impl_->device_slot_last_use[sidx]; target = static_cast<int>(sidx); }
         }
+        return target;
+    };
+
+    // Saves the live backend state into a device slot (no logits kept: the slot is a mid-prompt checkpoint, a
+    // later request prefills from it).
+    auto save_checkpoint_slot = [&](bool anchor) {
+        const uint32_t n_slots = impl_->backend->device_snapshot_slots();
+        if (n_slots == 0) return;
+        const std::vector<int32_t> live = impl_->backend->context_tokens();
+        for (uint32_t sidx = 0; sidx < n_slots; ++sidx) {
+            if (impl_->backend->device_snapshot_tokens(sidx) == live) return;
+        }
+        const int target = pick_slot(anchor);
         if (target >= 0 && impl_->backend->device_snapshot_save(static_cast<uint32_t>(target)).ok()) {
             impl_->device_slot_last_use[static_cast<size_t>(target)] = ++impl_->device_slot_clock;
+            impl_->device_slot_anchor[static_cast<size_t>(target)] = anchor ? 1 : 0;
             auto& sl = impl_->device_slot_logits[static_cast<size_t>(target)];
             sl.logits.clear();
             sl.greedy_token = -1;
         }
     };
+
+    // Where the system part of the prompt ends (the first user block), when it is long enough to be worth a slot.
+    size_t anchor_pos = 0;
+    if (impl_->cfg.enable_prefix_cache && impl_->backend->device_snapshot_slots() > 1) {
+        auto ub = impl_->backend->tokenize("<|im_start|>user", false);
+        if (ub.ok() && !ub.value().empty() && prompt_tokens.size() > ub.value().size()) {
+            const auto it = std::search(prompt_tokens.begin(), prompt_tokens.end(), ub.value().begin(), ub.value().end());
+            const size_t at = static_cast<size_t>(it - prompt_tokens.begin());
+            if (it != prompt_tokens.end() && at >= 512) anchor_pos = at;
+        }
+    }
 
     // Long prefills leave two tail checkpoints (512 and 64 tokens before the end of the prompt): the next request
     // about the same document differs only in its last tokens (the question and the template tail), and neither
@@ -2398,7 +2854,12 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             if (n_total > 512 && n_total - 512 >= from + 256) cuts.push_back(n_total - 512);
             cuts.push_back(n_total - 64);
         }
+        // the end of a long system prompt, when this prefill passes it
+        const bool with_anchor = anchor_pos >= from + 256 && anchor_pos + 8 <= n_total;
+        if (with_anchor) cuts.push_back(anchor_pos);
         cuts.push_back(n_total);
+        std::sort(cuts.begin(), cuts.end());
+        cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
         size_t pos = from;
         for (const size_t cut : cuts) {
             std::vector<int32_t> delta(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(pos),
@@ -2408,17 +2869,20 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             // already loaded waited behind the remaining loads (median 223 s; 0.4 s once all were loaded). The
             // stream is leased, so its prefill needs neither the lock nor the setup section; the backend hands the
             // device to waiting requests between chunks.
-            const bool release = n_streams > 1 && delta.size() >= 1024 && backend_lock.owns_lock();
+            // (a background request releases the lock for every part of its prompt, short tails included)
+            const bool release = n_streams > 1 && (delta.size() >= 1024 || req.background) && backend_lock.owns_lock();
             std::unique_lock<std::mutex> long_lock;
             if (release) {
                 setup_section.end();
                 backend_lock.unlock();
                 long_lock = std::unique_lock<std::mutex>(impl_->long_prefill_mutex);
             }
-            auto fw = impl_->backend->forward_tokens(delta, 0);   // 0: the backend's largest chunk (n_batch)
+            // 0: the backend's largest chunk (n_batch), the fastest way to load a prompt. A background request
+            // loads in chunks of 256 rows (about 0.3 s each on the Thor) and yields the device between them.
+            auto fw = impl_->backend->forward_tokens(delta, req.background ? 256u : 0u);
             if (release) {
                 long_lock.unlock();
-                backend_lock.lock();
+                lock_requests(backend_lock);
                 setup_section.on = true;
                 impl_->backend->begin_setup();
             }
@@ -2432,7 +2896,7 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             if (cut == n_total) {
                 current_logits = std::move(fw.value());
             } else {
-                save_checkpoint_slot();
+                save_checkpoint_slot(with_anchor && cut == anchor_pos);
             }
         }
         return check_numeric(current_logits);
@@ -2452,7 +2916,7 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             while (lcp < lim && hist[lcp] == prompt_tokens[lcp]) {
                 ++lcp;
             }
-            const size_t keep = std::min(lcp, n - 1);
+            const size_t keep = image_safe_keep(prompt_tokens, std::min(lcp, n - 1));
             if (keep > 0) {
                 const size_t to_remove = hist.size() - keep;
                 if (to_remove == 0 ||
@@ -2490,12 +2954,18 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
                     if (impl_->device_slot_last_use.size() < n_dev_slots) impl_->device_slot_last_use.resize(n_dev_slots, 0);
                     if (impl_->device_slot_logits.size() < n_dev_slots) impl_->device_slot_logits.resize(n_dev_slots);
                     auto& sl = impl_->device_slot_logits[static_cast<size_t>(best)];
-                    if (best_len == n && (!sl.logits.empty() || sl.greedy_token >= 0)) {
+                    // What the slot kept after its prefill: the full logits row, or (prefill under the device's
+                    // argmax) only the chosen token with a stand-in row that is 1 at that token and 0 elsewhere.
+                    // A request that samples or is constrained reads the row: drawn from the stand-in, its first
+                    // token was one of the lowest token ids ('*', '+', '%', a digit) nine times out of ten.
+                    const bool slot_row = !sl.logits.empty() && sl.greedy_token < 0;
+                    const bool need_row = !greedy || answer_constraint;
+                    if (best_len == n && (slot_row || (!need_row && sl.greedy_token >= 0))) {
                         // Identical prompt: the post-prefill logits were kept with the slot, nothing to evaluate
                         current_logits = sl.logits;
-                        if (sl.greedy_token >= 0) {
-                            impl_->backend->set_last_sampled_greedy_token(sl.greedy_token);
-                        }
+                        impl_->backend->set_last_sampled_greedy_token(
+                            slot_row ? core::DeterministicSampler::sample_greedy_argmax(sl.logits.data(), impl_->backend->vocab_size())
+                                     : sl.greedy_token);
                         reused = n;
                         done = true;
                     } else if (best_len < n) {
@@ -2610,15 +3080,24 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
         if (impl_->device_slot_last_use.size() < n_dev_slots_save) impl_->device_slot_last_use.resize(n_dev_slots_save, 0);
         int target = -1;
         for (uint32_t sidx = 0; sidx < n_dev_slots_save; ++sidx) {
-            if (impl_->backend->device_snapshot_tokens(sidx) == prompt_tokens) { target = -2; break; }
+            if (impl_->backend->device_snapshot_tokens(sidx) == prompt_tokens) {
+                target = -2;
+                // The slot holds this prompt already. If it kept only the device's argmax and this request has
+                // the full row, keep the row: the next request for this prompt, sampled or not, evaluates nothing.
+                if (impl_->device_slot_logits.size() < n_dev_slots_save) impl_->device_slot_logits.resize(n_dev_slots_save);
+                auto& have = impl_->device_slot_logits[sidx];
+                if (have.greedy_token >= 0 && !current_logits.empty() && !impl_->backend->supports_gpu_greedy_sampling()) {
+                    have.logits = current_logits;
+                    have.greedy_token = -1;
+                }
+                break;
+            }
         }
         if (target != -2) {
-            uint64_t oldest = UINT64_MAX;
-            for (uint32_t sidx = 0; sidx < n_dev_slots_save; ++sidx) {
-                if (impl_->device_slot_last_use[sidx] < oldest) { oldest = impl_->device_slot_last_use[sidx]; target = static_cast<int>(sidx); }
-            }
+            target = pick_slot(false);
             if (target >= 0 && impl_->backend->device_snapshot_save(static_cast<uint32_t>(target)).ok()) {
                 impl_->device_slot_last_use[static_cast<size_t>(target)] = ++impl_->device_slot_clock;
+                impl_->device_slot_anchor[static_cast<size_t>(target)] = 0;
                 if (impl_->device_slot_logits.size() < n_dev_slots_save) impl_->device_slot_logits.resize(n_dev_slots_save);
                 auto& sl = impl_->device_slot_logits[static_cast<size_t>(target)];
                 sl.logits = current_logits;
@@ -2659,6 +3138,28 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
         setup_section.end();
         backend_lock.unlock();
         impl_->backend->begin_generation();
+    }
+    // The backend this request decodes with: the shared one, or a constrained view of it for this request
+    std::shared_ptr<core::IBackend> gen_backend = impl_->backend;
+    std::shared_ptr<core::ConstrainedBackend> constrained;
+    if (answer_constraint) {
+        if (current_logits.empty()) {
+            return Result<ChatCompletionResponse>(ErrorCode::BackendError, "constrained decoding: no logits after the prefill");
+        }
+        core::ConstrainedBackend::Options copts;
+        copts.start_token = constraint_start_token;
+        const bool penalties = sampling.mode != ExecutionMode::StrictReplay &&
+                               (sampling.repetition_penalty != 1.0f || sampling.presence_penalty != 0.0f);
+        // Greedy: the best allowed token. Sampling: the top_k best allowed ones; with penalties (they reorder the
+        // row after the constraint) or an unbounded top_k every refused token is masked, which scans the vocabulary.
+        copts.keep = greedy ? 1u
+                            : ((penalties || sampling.top_k <= 0 || sampling.top_k > 256) ? 0u : static_cast<uint32_t>(sampling.top_k));
+        constrained = std::make_shared<core::ConstrainedBackend>(impl_->backend, *answer_constraint, copts);
+        if (Status cst = constrained->constrain_current(current_logits); !cst.ok()) {
+            return cst;
+        }
+        gen_backend = constrained;
+        resp.constrained = true;
     }
     BudgetTracker budget_tracker(budgets);
     bool in_think = rp.opens_think_block;
@@ -2737,15 +3238,29 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
         spec_cfg.enable_suffix_drafter = false;
         spec_cfg.neural_drafter = NeuralDrafterType::None;
     }
-    speculative::SpeculativeDecoder spec_decoder(spec_cfg, impl_->backend, impl_->drafter);
+    speculative::SpeculativeDecoder spec_decoder(spec_cfg, gen_backend, impl_->drafter);
 
     const int64_t created_ts = static_cast<int64_t>(std::time(nullptr));
     bool cancelled = false;
     bool stopped = false;
     bool sent_role = false;
 
-    auto emit_delta = [&](const char* field, const std::string& text) -> bool {
+    // A character can span two tokens: its first bytes wait here until the rest arrives (per field).
+    std::string held_content;
+    std::string held_reasoning;
+    auto emit_delta = [&](const char* field, const std::string& piece_text, bool flush = false) -> bool {
         if (!stream_sink) {
+            return true;
+        }
+        std::string& held = (std::strcmp(field, "content") == 0) ? held_content : held_reasoning;
+        std::string text = held + piece_text;
+        held.clear();
+        if (!flush) {
+            const size_t whole = utf8_whole_prefix(text);
+            held = text.substr(whole);
+            text.resize(whole);
+        }
+        if (text.empty()) {
             return true;
         }
         json delta = json::object();
@@ -2767,7 +3282,7 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
                 }
             })}
         };
-        if (!stream_sink("data: " + chunk.dump() + "\n\n")) {
+        if (!stream_sink("data: " + client_json(chunk) + "\n\n")) {
             cancelled = true;
             resp.finish_reason = "cancelled";
             return false;
@@ -2901,8 +3416,8 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
     if (!stopped && !cancelled) {
         int32_t t0 = -1;
         if (greedy) {
-            if (impl_->backend->supports_gpu_greedy_sampling() && impl_->backend->last_sampled_greedy_token() >= 0) {
-                t0 = impl_->backend->last_sampled_greedy_token();
+            if (gen_backend->supports_gpu_greedy_sampling() && gen_backend->last_sampled_greedy_token() >= 0) {
+                t0 = gen_backend->last_sampled_greedy_token();
             } else if (!current_logits.empty()) {
                 t0 = core::DeterministicSampler::sample_greedy_argmax(current_logits.data(), impl_->backend->vocab_size());
             }
@@ -2949,10 +3464,28 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             return Status::Error(ErrorCode::BackendError, "speculative step committed a different first token than the prefill sampled");
         }
 
+        bool all_processed = true;   // every committed token reached the answer (the grammar state covers them all)
         for (size_t ci = (pre_emitted_tok >= 0) ? 1u : 0u; ci < committed.size(); ++ci) {
-            if (!process_token(committed[ci])) break;
+            if (!process_token(committed[ci])) {
+                all_processed = ci + 1 == committed.size();
+                break;
+            }
         }
         pre_emitted_tok = -1;
+
+        // Constrained answer: the document is complete once the grammar can end and the text does not end in a
+        // digit (a number at the root may still grow). Nothing but end of generation can follow, so stop here
+        // instead of spending a step on that token; a document that closes on the last allowed token is "stop",
+        // not "length".
+        const bool budget_stop = resp.finish_reason == "length" || resp.finish_reason == "answer_budget_exceeded";
+        if (constrained && all_processed && !cancelled && !in_think && (!stopped || budget_stop) &&
+            !answer_text.empty() && constrained->can_end()) {
+            const char last = answer_text.back();
+            if (last < '0' || last > '9') {
+                resp.finish_reason = "stop";
+                stopped = true;
+            }
+        }
 
         if (stopped || cancelled) {
             break;
@@ -2967,7 +3500,7 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             if (!inj_tok.ok()) {
                 return inj_tok.status();
             }
-            auto fw = impl_->backend->forward_tokens(inj_tok.value());
+            auto fw = gen_backend->forward_tokens(inj_tok.value());
             if (!fw.ok()) {
                 return fw.status();
             }
@@ -2995,7 +3528,14 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
                                 ? (static_cast<double>(resp.completion_tokens) * 1000.0 / decode_ms)
                                 : 0.0;
     resp.mean_acceptance_length = spec_decoder.stats().mean_acceptance_length;
+    if (constrained) {
+        resp.constraint_rows_changed = static_cast<uint32_t>(constrained->stats().rows_changed);
+        resp.constraint_drafts_refused = static_cast<uint32_t>(constrained->stats().tokens_refused);
+    }
     resp.reasoning_content = think_text;
+    if (constrained) {
+        answer_text.erase(0, answer_text.find_first_not_of('\n'));   // glue in front of the document
+    }
     resp.content = answer_text;
 
     // Tool call detection & validation (Qwen3.8 <function=...> syntax or JSON inside <tool_call>)
@@ -3042,6 +3582,9 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
         resp.finish_reason = "cancelled";
     } else {
         if (stream_sink) {
+            // bytes of a character whose rest never came are sent as they are (U+FFFD in the JSON)
+            (void)emit_delta("reasoning_content", std::string(), true);
+            (void)emit_delta("content", std::string(), true);
             json final_chunk = {
                 {"id", resp.id},
                 {"object", "chat.completion.chunk"},
@@ -3066,6 +3609,9 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
                     {"tpot_ms", resp.tpot_ms},
                     {"decode_tok_per_s", resp.decode_tok_per_s},
                     {"mean_acceptance_length", resp.mean_acceptance_length},
+                    {"constrained", resp.constrained},
+                    {"constraint_rows_changed", resp.constraint_rows_changed},
+                    {"constraint_drafts_refused", resp.constraint_drafts_refused},
                     {"prefill_ms", resp.prefill_ms},
                     {"snapshot_ms", resp.snapshot_ms}
                 }}
@@ -3078,7 +3624,7 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
                 }
                 final_chunk["choices"][0]["delta"]["tool_calls"] = tcs;
             }
-            if (!stream_sink("data: " + final_chunk.dump() + "\n\n") ||
+            if (!stream_sink("data: " + client_json(final_chunk) + "\n\n") ||
                 !stream_sink("data: [DONE]\n\n")) {
                 impl_->cancelled_requests.fetch_add(1, std::memory_order_relaxed);
                 resp.finish_reason = "cancelled";

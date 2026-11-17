@@ -174,10 +174,36 @@ python3 scripts/speech_short_check.py --url http://127.0.0.1:8088           # on
 `ab_bench.py` takes several engines (`--engines a=URL,b=URL --reference b`) and compares their answers with the
 reference's, so any OpenAI-compatible server on the same machine can be put next to this one.
 
+## Build from source
+
+The engine's sources in this repository are those of 1.0.0-rc3 (Apache-2.0). They build the programs of the
+archive (`sixi-server`, `sixi-cli`, `sixi-bench`), the library behind them and the tests:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSIXI_VERSION_SUFFIX=-rc3
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+You need CMake 3.24 or newer, a C++20 compiler, OpenSSL, and the CUDA toolkit for the engine's own kernels
+(`-DSIXI_ENABLE_CUDA=OFF` builds without them). At run time the programs load the backend library, which is
+published in binary form: take `lib/libllama.so` from the release archive and name it to the engine,
+
+```bash
+SIXI_LLAMA_LIB_PATH=/path/to/sixi-asi-1.0.0-rc3-jetson-thor-aarch64/lib/libllama.so \
+  build/sixi-server --model model.gguf --draft-model drafter.gguf --port 8089
+```
+
+or copy the built programs into the archive's `bin/` and use `./sixi` as before. A server built this way writes
+the same tokens at the same speed as the released one (60 of 60 prompts of `scripts/speed_set.py`).
+
+`patches/` and `scripts/build_llamacpp.sh` are those of 0.11.0 and build the backend of that version. The changes
+to llama.cpp v1.0.0 that 1.0 runs on are not published; they are in the archive's library.
+
 ## License
 
-The archive is free to use for any purpose and to pass on unchanged: see its `LICENSE` file (`LICENSE-BINARY` in
-this repository). It includes llama.cpp, cpp-httplib and nlohmann/json under their MIT licenses (`licenses/`).
-From 1.0.0-rc1 the engine is released in binary form (the `sixi` and `sixi-speech` commands and the measurement
-scripts in the archive are plain Python); the sources in this repository are those of 0.11.0 (Apache-2.0,
-`LICENSE`).
+The sources in this repository are Apache-2.0 (`LICENSE`). The release archive is free to use for any purpose and
+to pass on unchanged: see its `LICENSE` file (`LICENSE-BINARY` in this repository). It includes llama.cpp,
+cpp-httplib and nlohmann/json under their MIT licenses (`licenses/`). The backend library of 1.0 (llama.cpp v1.0.0
+with this engine's kernel and drafter changes) is released in binary form; the `sixi` and `sixi-speech` commands
+and the measurement scripts are plain Python.

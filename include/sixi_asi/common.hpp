@@ -8,6 +8,11 @@
 #include <optional>
 #include <vector>
 
+// Version the build reports (set once, in CMakeLists.txt)
+#ifndef SIXI_ASI_VERSION
+#define SIXI_ASI_VERSION "unknown"
+#endif
+
 namespace sixi_asi {
 
 using Bytes = uint64_t;

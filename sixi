@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+"""sixi: the front door of the Sixi-ASI Engine.
+
+  ./sixi setup              build the engine and its llama.cpp backend (once)
+  ./sixi pull               download the default model (see `./sixi models`)
+  ./sixi chat               talk to it in the terminal
+  ./sixi run "question"     one answer, then exit
+  ./sixi serve              OpenAI-compatible HTTP server on http://127.0.0.1:8089
+  ./sixi doctor             what is installed, what is missing
+  ./sixi stop               stop a server that chat / run left running
+
+Models are named as in `configs/models.json` (`-m NAME`) or given as a path to a GGUF file (`-m file.gguf`).
+Files live under $SIXI_HOME (default ~/.sixi): models/, the backend build, logs. Python standard library only;
+nothing here is on the inference path, the engine is the C++ server this script starts.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+HOME = os.path.expanduser(os.environ.get("SIXI_HOME", "~/.sixi"))
+MODELS_DIR = os.path.expanduser(os.environ.get("SIXI_MODELS_DIR", os.path.join(HOME, "models")))
+PACKAGED = os.path.isfile(os.path.join(ROOT, "bin", "sixi-server"))   # a binary release: bin/ and lib/ next to this file
+SERVER_BIN = os.path.join(ROOT, "bin" if PACKAGED else "build", "sixi-server")
+DEFAULT_PORT = 8089
+TTY = sys.stdout.isatty()
+
+
+def dim(s):
+    return f"\033[2m{s}\033[0m" if TTY else s
+
+
+def bold(s):
+    return f"\033[1m{s}\033[0m" if TTY else s
+
+
+def die(msg, code=1):
+    print(f"sixi: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def gb(n):
+    return f"{n / 1e9:.1f} GB"
+
+
+# ---------------------------------------------------------------------------------------------- registry and files
+
+def registry():
+    with open(os.path.join(ROOT, "configs", "models.json")) as f:
+        return json.load(f)
+
+
+def resolve_model(name):
+    """-> (display name, registry entry or None when the name is a GGUF file)."""
+    reg = registry()
+    name = name or reg["default"]
+    if name in reg["models"]:
+        return name, reg["models"][name]
+    if os.path.isfile(name):
+        return os.path.basename(name), None
+    known = ", ".join(sorted(reg["models"]))
+    die(f"unknown model '{name}': not one of [{known}] and not a file")
+
+
+def candidate_paths(f):
+    """Where a registry file may already be: the sixi store, then the Hugging Face cache."""
+    out = [os.path.join(MODELS_DIR, f["repo"], f["path"])]
+    hub = os.path.expanduser(os.environ.get("HF_HUB_CACHE", os.path.join(os.environ.get("HF_HOME", "~/.cache/huggingface"), "hub")))
+    snaps = os.path.join(hub, "models--" + f["repo"].replace("/", "--"), "snapshots")
+    if os.path.isdir(snaps):
+        for rev in sorted(os.listdir(snaps)):
+            out.append(os.path.join(snaps, rev, f["path"]))
+    return out
+
+
+def find_file(f):
+    for p in candidate_paths(f):
+        if os.path.isfile(p) and os.path.getsize(p) == f["bytes"]:
+            return p
+    return None
+
+
+def model_files(entry):
+    """-> ({role: path}, [missing file entries]). Parts of a split model must sit next to the first part."""
+    found, missing = {}, []
+    for f in entry["files"]:
+        p = find_file(f)
+        if p is None:
+            missing.append(f)
+        elif f["role"] != "part":
+            found[f["role"]] = p
+    if not missing and "model" in found:
+        base = os.path.dirname(found["model"])
+        for f in entry["files"]:
+            if f["role"] == "part" and not os.path.isfile(os.path.join(base, os.path.basename(f["path"]))):
+                missing.append(f)
+    return found, missing
+
+
+def sha256_of(path, label):
+    h = hashlib.sha256()
+    size = os.path.getsize(path)
+    done = 0
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(8 << 20)
+            if not b:
+                break
+            h.update(b)
+            done += len(b)
+            if TTY:
+                print(f"\r  checking {label}  {100 * done / max(size, 1):5.1f}%", end="", flush=True)
+    if TTY:
+        print("\r" + " " * 70 + "\r", end="")
+    return h.hexdigest()
+
+
+def download(f, verify):
+    dest = os.path.join(MODELS_DIR, f["repo"], f["path"])
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    part = dest + ".part"
+    have = os.path.getsize(part) if os.path.exists(part) else 0
+    if have > f["bytes"]:
+        os.remove(part)
+        have = 0
+    label = os.path.basename(f["path"])
+    if have < f["bytes"]:
+        url = f"https://huggingface.co/{f['repo']}/resolve/main/{f['path']}"
+        req = urllib.request.Request(url, headers={"User-Agent": "sixi"})
+        if have:
+            req.add_header("Range", f"bytes={have}-")
+        token = os.environ.get("HF_TOKEN")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            resp = urllib.request.urlopen(req, timeout=60)
+        except urllib.error.HTTPError as e:
+            die(f"download of {url} failed: HTTP {e.code} {e.reason}")
+        except urllib.error.URLError as e:
+            die(f"download of {url} failed: {e.reason}")
+        if have and resp.status != 206:   # the server ignored the range: start again
+            have = 0
+        t0, got0, last = time.time(), have, 0.0
+        with resp, open(part, "ab" if have else "wb") as out:
+            while True:
+                b = resp.read(4 << 20)
+                if not b:
+                    break
+                out.write(b)
+                have += len(b)
+                now = time.time()
+                if now - last > 0.5:
+                    last = now
+                    rate = (have - got0) / max(now - t0, 1e-3)
+                    eta = (f["bytes"] - have) / max(rate, 1)
+                    line = f"  {label}  {gb(have)} of {gb(f['bytes'])}  {rate / 1e6:6.1f} MB/s  {int(eta // 60)} min {int(eta % 60):02d} s left"
+                    print(("\r" + line.ljust(100)) if TTY else line, end="" if TTY else "\n", flush=True)
+        if TTY:
+            print()
+    if os.path.getsize(part) != f["bytes"]:
+        die(f"{label}: got {os.path.getsize(part)} bytes, expected {f['bytes']} (run the command again to resume)")
+    if verify and f.get("sha256"):
+        if sha256_of(part, label) != f["sha256"]:
+            os.remove(part)
+            die(f"{label}: checksum mismatch, the partial file was removed")
+    os.replace(part, dest)
+    return dest
+
+
+# ---------------------------------------------------------------------------------------------- engine and backend
+
+def backend_lib():
+    """libllama.so the engine loads: $SIXI_LLAMA_LIB_PATH, the build `sixi setup` makes, then the older location."""
+    env = os.environ.get("SIXI_LLAMA_LIB_PATH")
+    cands = ([env] if env else []) + ([os.path.join(ROOT, "lib", "libllama.so")] if PACKAGED else []) + [
+                                      os.path.join(HOME, "llama.cpp", "build", "bin", "libllama.so"),
+                                      os.path.expanduser("~/.unsloth/llama.cpp-pinned/build/bin/libllama.so")]
+    for p in cands:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+def backend_has(lib, soname, symbol):
+    path = os.path.join(os.path.dirname(lib), soname)
+    try:
+        with open(path, "rb") as f:
+            return symbol.encode() in f.read()
+    except OSError:
+        return False
+
+
+def backend_status(lib):
+    """Which engine features the backend library supports."""
+    return {"backend: engine build": backend_has(lib, "libllama.so", "llama_model_memory_size"),
+            "backend: JSON schema": backend_has(lib, "libllama-common.so", "common_json_schema_to_grammar_c")
+                                    or backend_has(lib, "libllama.so", "common_json_schema_to_grammar_c")}
+
+
+def is_thor():
+    try:
+        with open("/proc/device-tree/model") as f:
+            return "Thor" in f.read()
+    except OSError:
+        return False
+
+
+def machine_summary():
+    model = ""
+    try:
+        with open("/proc/device-tree/model") as f:
+            model = f.read().strip("\x00\n ")
+    except OSError:
+        pass
+    if not model and shutil.which("nvidia-smi"):
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
+        model = "; ".join(x.strip() for x in r.stdout.splitlines() if x.strip())
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            mem[k] = int(v.split()[0]) * 1024
+    return model or "no NVIDIA GPU found", mem.get("MemTotal", 0), mem.get("MemAvailable", 0)
+
+
+def engine_version():
+    if not os.path.isfile(SERVER_BIN):
+        return None
+    r = subprocess.run([SERVER_BIN, "--version"], capture_output=True, text=True)
+    return r.stdout.strip() or "built"
+
+
+def need_engine():
+    if not os.path.isfile(SERVER_BIN):
+        die("the engine is not built yet: run ./sixi setup")
+    lib = backend_lib()
+    if lib is None:
+        die("the llama.cpp backend is not built yet: run ./sixi setup")
+    return lib
+
+
+# ---------------------------------------------------------------------------------------------- server control
+
+def base_url(a):
+    return f"http://{a.host}:{a.port}"
+
+
+def healthy(a):
+    try:
+        with urllib.request.urlopen(base_url(a) + "/health", timeout=2) as r:
+            return r.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def pid_file(port):
+    return os.path.join(HOME, f"server-{port}.pid")
+
+
+def server_argv(a, lib):
+    """Command line of sixi-server for the chosen model and options."""
+    argv = [SERVER_BIN, "--host", a.host, "--port", str(a.port)]
+    if getattr(a, "reference", False):
+        return argv + ["--backend", "reference"]
+    name, entry = resolve_model(a.model)
+    ctx = a.ctx
+    if entry is None:
+        argv += ["--model", os.path.abspath(a.model)]
+        if a.draft:
+            argv += ["--draft-model", os.path.abspath(a.draft)]
+    else:
+        files, missing = model_files(entry)
+        if missing:
+            die(f"model '{name}' is not downloaded ({gb(sum(f['bytes'] for f in missing))} missing): run ./sixi pull -m {name}")
+        for role, path in files.items():
+            argv += [f"--{role}", path]
+        # a registry argument that names a file of this installation (a draft vocabulary) is given by its full path
+        argv += [os.path.join(ROOT, x) if (not x.startswith("-") and os.path.isfile(os.path.join(ROOT, x))) else x
+                 for x in entry.get("server_args", [])]
+        ctx = ctx or entry.get("ctx")
+        if a.parallel > 1 and not entry.get("parallel_ok", True):
+            die(f"'{name}' drafts with a single-stream head: use --parallel 1, or add `-- --no-spec` for parallel plain decoding")
+    if ctx:
+        argv += ["--ctx", str(ctx)]
+    if a.parallel > 1:
+        argv += ["--parallel", str(a.parallel)]
+    if a.api_key:
+        argv += ["--api-key", a.api_key]
+    return argv + list(a.extra or [])
+
+
+def server_env(lib):
+    env = dict(os.environ)
+    env.setdefault("SIXI_LLAMA_LIB_PATH", lib)
+    return env
+
+
+def start_background(a):
+    """Start a server for chat / run and wait until it answers. Returns the Popen object."""
+    lib = need_engine()
+    argv = server_argv(a, lib)
+    os.makedirs(HOME, exist_ok=True)
+    log_path = os.path.join(HOME, f"server-{a.port}.log")
+    log = open(log_path, "w")
+    proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=server_env(lib), start_new_session=True)
+    with open(pid_file(a.port), "w") as f:
+        f.write(str(proc.pid))
+    t0 = time.time()
+    while True:
+        if healthy(a):
+            break
+        if proc.poll() is not None:
+            tail = "".join(open(log_path, errors="replace").readlines()[-12:])
+            die(f"the server stopped while starting (exit {proc.returncode}); last lines of {log_path}:\n{tail}")
+        if TTY:
+            print(f"\r{dim(f'loading the model ... {int(time.time() - t0)} s')}", end="", flush=True)
+        time.sleep(0.5)
+    if TTY:
+        print("\r" + " " * 50 + "\r", end="")
+    return proc
+
+
+def stop_pid(pid):
+    """SIGTERM a server by pid, only if that pid still is a sixi-server."""
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            if f.read().strip() != "sixi-server":
+                return False
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        return False
+    for _ in range(100):
+        if not os.path.exists(f"/proc/{pid}"):
+            break
+        time.sleep(0.1)
+    return True
+
+
+class Session:
+    """A server to talk to: the one already listening, or one started for this command and stopped after it."""
+
+    def __init__(self, a):
+        self.a, self.proc = a, None
+
+    def __enter__(self):
+        if not healthy(self.a):
+            self.proc = start_background(self.a)
+        return self
+
+    def __exit__(self, *exc):
+        if self.proc is not None and not self.a.keep:
+            stop_pid(self.proc.pid)
+            try:
+                os.remove(pid_file(self.a.port))
+            except OSError:
+                pass
+        elif self.proc is not None:
+            print(dim(f"server left running on {base_url(self.a)} (./sixi stop to end it)"), file=sys.stderr)
+
+
+def chat_request(a, messages, extra=None):
+    """Send one streamed chat completion; print it as it arrives. Returns the answer text."""
+    body = {"messages": messages, "stream": True, "max_tokens": a.max_tokens, "temperature": a.temperature,
+            "enable_thinking": not a.no_think}
+    body.update(extra or {})
+    headers = {"Content-Type": "application/json"}
+    if a.api_key:
+        headers["Authorization"] = f"Bearer {a.api_key}"
+    req = urllib.request.Request(base_url(a) + "/v1/chat/completions", data=json.dumps(body).encode(), headers=headers)
+    answer, thinking, t0, n_tok, finish, speed = [], False, time.time(), None, None, None
+    try:
+        resp = urllib.request.urlopen(req, timeout=3600)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("error", {}).get("message", "")
+        except Exception:
+            detail = ""
+        die(f"the server refused the request: HTTP {e.code} {detail}")
+    with resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if chunk.get("error"):
+                if answer or thinking:
+                    print()
+                die(f"the server reported: {chunk['error'].get('message', chunk['error'])}")
+            if chunk.get("usage"):
+                n_tok = chunk["usage"].get("completion_tokens", n_tok)
+            if chunk.get("metrics"):
+                speed = chunk["metrics"].get("decode_tok_per_s")
+            for ch in chunk.get("choices", []):
+                delta = ch.get("delta") or {}
+                finish = ch.get("finish_reason") or finish
+                if delta.get("reasoning_content") and not a.quiet:
+                    thinking = True
+                    print(dim(delta["reasoning_content"]), end="", flush=True)
+                if delta.get("content"):
+                    if thinking:
+                        print("\n")
+                        thinking = False
+                    answer.append(delta["content"])
+                    print(delta["content"], end="", flush=True)
+    print(flush=True)
+    if not a.quiet:
+        dt = time.time() - t0
+        note = (f"{n_tok} tokens, " if n_tok else "") + (f"{speed:.1f} tok/s, " if speed else "")
+        print(dim(f"[{note}{dt:.1f} s{', stopped at the token limit' if finish == 'length' else ''}]"), file=sys.stderr)
+    return "".join(answer)
+
+
+# ---------------------------------------------------------------------------------------------- commands
+
+def cmd_models(a):
+    reg = registry()
+    for name, entry in reg["models"].items():
+        files, missing = model_files(entry)
+        total = sum(f["bytes"] for f in entry["files"])
+        state = "downloaded" if not missing else f"not downloaded ({gb(sum(f['bytes'] for f in missing))} to fetch)"
+        print(f"{bold(name)}{'  (default)' if name == reg['default'] else ''}")
+        print(f"  {entry['title']}")
+        print(f"  {gb(total)} on disk, licence {entry['license']}: {state}")
+        if entry.get("measured"):
+            print(f"  {entry['measured']}")
+
+
+def cmd_pull(a):
+    name, entry = resolve_model(a.model)
+    if entry is None:
+        die("pull takes a model name from ./sixi models")
+    todo = [f for f in entry["files"] if find_file(f) is None]
+    if not todo:
+        print(f"{name}: already downloaded")
+        return
+    need = sum(f["bytes"] for f in todo)
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    free = shutil.disk_usage(MODELS_DIR).free
+    print(f"{name}: {len(todo)} file(s), {gb(need)}, into {MODELS_DIR} ({gb(free)} free)")
+    if a.dry_run:
+        for f in todo:
+            print(f"  https://huggingface.co/{f['repo']}/resolve/main/{f['path']}  {gb(f['bytes'])}")
+        return
+    if free < need + (2 << 30):
+        die(f"not enough disk space in {MODELS_DIR}: {gb(need)} needed, {gb(free)} free (set SIXI_MODELS_DIR)")
+    for f in todo:
+        download(f, not a.no_verify)
+    print(f"{name}: ready. Try: ./sixi chat -m {name}")
+
+
+def cmd_serve(a):
+    lib = need_engine()
+    argv = server_argv(a, lib)
+    if healthy(a):
+        die(f"something already answers on {base_url(a)} (./sixi stop, or pick another --port)")
+    print(dim(" ".join(argv)), flush=True)
+    os.execve(argv[0], argv, server_env(lib))
+
+
+# ---------------------------------------------------------------------------------------------- background service
+
+UNIT = "sixi-asi.service"
+UNIT_PATH = os.path.expanduser(os.path.join("~/.config/systemd/user", UNIT))
+SERVICE_LOG = os.path.join(HOME, "service.log")
+
+
+def systemctl(*args, check=True):
+    r = subprocess.run(["systemctl", "--user", *args])
+    if check and r.returncode != 0:
+        die(f"systemctl --user {' '.join(args)} failed (exit {r.returncode})")
+    return r.returncode
+
+
+def unit_port(default):
+    """The port the installed unit serves."""
+    try:
+        with open(UNIT_PATH) as f:
+            m = re.search(r"--port (\d+)", f.read())
+        return int(m.group(1)) if m else default
+    except OSError:
+        return default
+
+
+def rotate_log(path, limit=64 * 1000 * 1000):
+    """Before a start: a log over the limit becomes <log>.1 (the one before it is dropped). The unit appends to the
+    file, so a service in use for weeks would otherwise keep every line it ever wrote."""
+    try:
+        if os.path.getsize(path) > limit:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+
+
+def cmd_service(a):
+    """The server as a systemd user service: starts with the session (or at boot), restarts after a failure."""
+    if not shutil.which("systemctl"):
+        die("systemd is not available here: run ./sixi serve instead")
+    if a.action == "install":
+        need_engine()
+        if a.model and resolve_model(a.model)[1] is not None:
+            _, missing = model_files(resolve_model(a.model)[1])
+            if missing:
+                die(f"model '{a.model}' is not downloaded: run ./sixi pull -m {a.model}")
+        cmd = [sys.executable or "/usr/bin/python3", os.path.join(ROOT, "sixi"), "serve", "--host", a.host, "--port", str(a.port),
+               "--parallel", str(a.parallel)]
+        if a.model:
+            cmd += ["-m", a.model if resolve_model(a.model)[1] is not None else os.path.abspath(a.model)]
+        if a.draft:
+            cmd += ["--draft", os.path.abspath(a.draft)]
+        if a.ctx:
+            cmd += ["--ctx", str(a.ctx)]
+        if getattr(a, "reference", False):
+            cmd += ["--reference"]
+        if a.extra:
+            cmd += ["--"] + list(a.extra)
+        def quote(x):   # systemd: double quotes around an argument with spaces, backslash escapes inside
+            if not any(c in x for c in ' "\\'):
+                return x
+            return '"' + x.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        env = [f"Environment=SIXI_HOME={HOME}", f"Environment=SIXI_MODELS_DIR={MODELS_DIR}"]
+        for k in ("HF_HOME", "HF_HUB_CACHE"):
+            if os.environ.get(k):
+                env.append(f"Environment={k}={os.environ[k]}")
+        if a.api_key:
+            env.append(f"Environment=SIXI_API_KEY={a.api_key}")
+        unit = "\n".join([
+            "[Unit]",
+            f"Description=Sixi-ASI Engine, OpenAI-compatible server on {a.host}:{a.port}",
+            "After=network.target",
+            "",
+            "[Service]",
+            "ExecStart=" + " ".join(quote(x) for x in cmd),
+            *env,
+            f"StandardOutput=append:{SERVICE_LOG}",
+            f"StandardError=append:{SERVICE_LOG}",
+            "Restart=on-failure",
+            "RestartSec=10",
+            "OOMScoreAdjust=900",
+            "",
+            "[Install]",
+            "WantedBy=default.target",
+            ""])
+        os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
+        os.makedirs(HOME, exist_ok=True)
+        fd = os.open(UNIT_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # may hold the API key
+        with os.fdopen(fd, "w") as f:
+            f.write(unit)
+        systemctl("daemon-reload")
+        if a.boot:
+            systemctl("enable", UNIT)
+        print(f"installed {UNIT_PATH}")
+        print(f"  ./sixi service start     then the API is at http://{a.host}:{a.port}/v1")
+        print("  ./sixi service status | logs | stop | restart | remove")
+        if a.boot:
+            print("  starts by itself with your session; at boot without a login it needs: loginctl enable-linger")
+        return
+    if not os.path.isfile(UNIT_PATH):
+        die("the service is not installed: ./sixi service install [--parallel N] [-m NAME] [--boot]")
+    if a.action in ("start", "stop", "restart"):
+        running = subprocess.run(["systemctl", "--user", "is-active", "--quiet", UNIT]).returncode == 0
+        if a.action == "restart" or (a.action == "start" and not running):   # a running service keeps writing to its file
+            rotate_log(SERVICE_LOG)
+        systemctl(a.action, UNIT)
+        if a.action != "stop":
+            print(f"starting; the model takes a moment to load. ./sixi service status shows when it answers on port {unit_port(a.port)}.")
+    elif a.action == "status":
+        state = subprocess.run(["systemctl", "--user", "is-active", UNIT], capture_output=True, text=True).stdout.strip()
+        port = unit_port(a.port)
+        a.port = port
+        answers = healthy(a)
+        print(f"service: {state}; http://{a.host}:{port}/v1 " + ("answers" if answers else "does not answer"
+              + (" yet (the model may still be loading)" if state == "active" else "")))
+        if state not in ("active", "inactive") and os.path.isfile(SERVICE_LOG):
+            print(f"last lines of {SERVICE_LOG}:")
+            print("".join(open(SERVICE_LOG, errors="replace").readlines()[-8:]), end="")
+        sys.exit(0 if answers else 1)
+    elif a.action == "logs":
+        if not os.path.isfile(SERVICE_LOG):
+            die(f"no log yet ({SERVICE_LOG}): the service has not been started")
+        os.execvp("tail", ["tail", "-n", "100", "-f", SERVICE_LOG] if TTY else ["tail", "-n", "100", SERVICE_LOG])
+    elif a.action == "remove":
+        systemctl("disable", "--now", UNIT, check=False)
+        os.remove(UNIT_PATH)
+        systemctl("daemon-reload")
+        print("removed")
+
+
+def cmd_link(a):
+    """Put the command on the PATH as `sixi-asi`: a link in ~/.local/bin to this installation."""
+    dest_dir = os.path.expanduser("~/.local/bin")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, "sixi-asi")
+    if os.path.lexists(dest):
+        if not os.path.islink(dest):
+            die(f"{dest} exists and is not a link: left as it is")
+        os.remove(dest)
+    os.symlink(os.path.join(ROOT, "sixi"), dest)
+    on_path = dest_dir in os.environ.get("PATH", "").split(os.pathsep)
+    print(f"{dest} -> {os.path.join(ROOT, 'sixi')}" + ("" if on_path else f"   (add {dest_dir} to your PATH)"))
+
+
+def cmd_chat(a):
+    with Session(a):
+        name = "reference backend" if a.reference else resolve_model(a.model)[0]
+        print(f"{bold('Sixi-ASI Engine')} · {name} · {base_url(a)}")
+        print(dim("/reset starts over, /exit leaves (so does Ctrl-D)"))
+        messages = []
+        if a.system:
+            messages.append({"role": "system", "content": a.system})
+        while True:
+            try:
+                text = input(bold("> ") if TTY else "").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not text:
+                continue
+            if text in ("/exit", "/quit"):
+                break
+            if text == "/reset":
+                messages = messages[:1] if a.system else []
+                continue
+            messages.append({"role": "user", "content": text})
+            try:
+                answer = chat_request(a, messages)
+            except KeyboardInterrupt:
+                print(dim("\n[interrupted]"))
+                messages.pop()
+                continue
+            messages.append({"role": "assistant", "content": answer})
+
+
+def cmd_run(a):
+    prompt = " ".join(a.prompt) if a.prompt else sys.stdin.read()
+    if not prompt.strip():
+        die("nothing to ask: give a prompt or pipe one in")
+    extra = {}
+    if a.schema:
+        with open(a.schema) as f:
+            extra["response_format"] = {"type": "json_schema", "json_schema": {"name": "answer", "strict": True, "schema": json.load(f)}}
+    elif a.json:
+        extra["response_format"] = {"type": "json_object"}
+    messages = ([{"role": "system", "content": a.system}] if a.system else []) + [{"role": "user", "content": prompt}]
+    with Session(a):
+        chat_request(a, messages, extra)
+
+
+def cmd_stop(a):
+    stopped = 0
+    if os.path.isdir(HOME):
+        for fn in os.listdir(HOME):
+            if fn.startswith("server-") and fn.endswith(".pid"):
+                path = os.path.join(HOME, fn)
+                try:
+                    pid = int(open(path).read().strip())
+                except (OSError, ValueError):
+                    pid = 0
+                if pid and stop_pid(pid):
+                    stopped += 1
+                    print(f"stopped the server with pid {pid}")
+                os.remove(path)
+    if not stopped:
+        print("no server started by sixi is running")
+
+
+def tool_version(cmd, flag="--version"):
+    exe = shutil.which(cmd)
+    if not exe:
+        return None
+    r = subprocess.run([exe, flag], capture_output=True, text=True)
+    out = (r.stdout or r.stderr).splitlines()
+    return out[0].strip() if out else "found"
+
+
+def cmd_doctor(a):
+    ok = True
+
+    def row(label, value, good=True):
+        nonlocal ok
+        ok = ok and good
+        print(f"  {'ok ' if good else 'NO '} {label:<26} {value}")
+
+    machine, total, avail = machine_summary()
+    print(bold("machine"))
+    row("hardware", machine)
+    row("memory", f"{gb(total)} total, {gb(avail)} available")
+    if not PACKAGED:
+        print(bold("build tools") + dim("  (needed by ./sixi setup)"))
+        for tool in ("git", "cmake", "g++", "nvcc"):
+            v = tool_version(tool)
+            row(tool, v or "not found", v is not None or os.path.isfile(SERVER_BIN))
+    print(bold("engine"))
+    ver = engine_version()
+    row("sixi-server", ver or "not built: ./sixi setup", ver is not None)
+    lib = backend_lib()
+    row("llama.cpp backend", lib or "not built: ./sixi setup", lib is not None)
+    if lib:
+        for what, has in backend_status(lib).items():
+            row(what, "yes" if has else "missing: ./sixi setup --rebuild-backend", has)
+    print(bold("models"))
+    reg = registry()
+    any_model = False
+    for name, entry in reg["models"].items():
+        _, missing = model_files(entry)
+        any_model = any_model or not missing
+        print(f"       {name:<26} {'downloaded' if not missing else 'not downloaded: ./sixi pull -m ' + name}")
+    print(bold("server"))
+    print(f"       {base_url(a):<26} {'running' if healthy(a) else 'not running'}")
+    if ok and any_model:
+        print("\nready: ./sixi chat")
+    elif ok:
+        print("\nnext: ./sixi pull")
+    sys.exit(0 if ok else 1)
+
+
+def run_step(title, argv, env=None, cwd=None):
+    print(bold(f"== {title}"))
+    print(dim("   " + " ".join(argv)))
+    r = subprocess.run(argv, env=env, cwd=cwd)
+    if r.returncode != 0:
+        die(f"step failed: {title} (exit {r.returncode})")
+
+
+def setup_packaged():
+    """A binary release has nothing to build: check that this machine can run it."""
+    ok = True
+
+    def row(what, value, good):
+        nonlocal ok
+        ok = ok and good
+        print(f"  {'ok ' if good else 'NO '} {what}: {value}")
+
+    model, total, _ = machine_summary()
+    row("machine", f"{model}, {gb(total)} memory", True)
+    target = ""
+    try:
+        with open(os.path.join(ROOT, "BUILD")) as f:
+            target = f.read().strip()
+    except OSError:
+        pass
+    if target:
+        print(f"      built for: {target}")
+    r = subprocess.run([SERVER_BIN, "--version"], capture_output=True, text=True)
+    said = (r.stdout.strip() or r.stderr.strip()).splitlines()
+    row("engine starts", said[-1] if said else f"exit {r.returncode}", r.returncode == 0)
+    lib = backend_lib()
+    row("backend library", lib or "missing from lib/", lib is not None)
+    if lib:
+        env = dict(os.environ, LD_LIBRARY_PATH=os.path.dirname(lib) + os.pathsep + os.environ.get("LD_LIBRARY_PATH", ""))
+        r = subprocess.run(["ldd", lib], capture_output=True, text=True, env=env)
+        lost = [ln.split()[0] for ln in r.stdout.splitlines() if "not found" in ln]
+        row("CUDA libraries", "found" if not lost else "not found: " + ", ".join(lost), r.returncode == 0 and not lost)
+    if not ok:
+        die("this release does not run on this machine as it is (see above)")
+    print(f"\nReady. Next: ./sixi pull, then ./sixi chat")
+
+
+def cmd_setup(a):
+    if PACKAGED:
+        return setup_packaged()
+    missing = [t for t in ("git", "cmake", "g++") if not shutil.which(t)]
+    if missing:
+        die("missing build tools: " + ", ".join(missing) + " (Ubuntu: sudo apt install git cmake g++ libssl-dev)")
+    if not shutil.which("nvcc") and not os.path.isdir("/usr/local/cuda"):
+        die("the CUDA toolkit was not found (nvcc): the backend needs it")
+    arch = a.cuda_arch or ("110" if is_thor() else "native")
+    jobs = str(a.jobs or os.cpu_count() or 4)
+    lib = backend_lib()
+    if lib is None or a.rebuild_backend:
+        dest = os.path.dirname(os.path.dirname(os.path.dirname(lib))) if (lib and a.rebuild_backend) else os.path.join(HOME, "llama.cpp")
+        env = dict(os.environ, CUDA_ARCH=arch, JOBS=jobs)
+        run_step(f"llama.cpp backend (CUDA architecture {arch}; takes a while)",
+                 [os.path.join(ROOT, "scripts", "build_llamacpp.sh"), "", dest], env=env)
+    else:
+        print(bold("== llama.cpp backend") + f": found at {lib}")
+        absent = [what for what, has in backend_status(lib).items() if not has]
+        if absent:
+            print(f"   it lacks: {'; '.join(absent)}. Rebuild with ./sixi setup --rebuild-backend")
+    cfg = ["cmake", "-S", ROOT, "-B", os.path.join(ROOT, "build"), "-DCMAKE_BUILD_TYPE=Release"]
+    if arch != "110":
+        cfg.append(f"-DCMAKE_CUDA_ARCHITECTURES={arch}")
+    run_step("engine: configure", cfg)
+    run_step("engine: build", ["cmake", "--build", os.path.join(ROOT, "build"), "-j", jobs])
+    print(f"\n{engine_version()} is built. Next: ./sixi pull, then ./sixi chat")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="sixi", description="Sixi-ASI Engine: run Qwen3.8 locally with speculative decoding.",
+                                 epilog="First time: ./sixi setup && ./sixi pull && ./sixi chat. "
+                                        "Options after `--` (serve, chat, run) are passed to sixi-server as they are.")
+    sub = ap.add_subparsers(dest="cmd", metavar="command")
+
+    def common(p, serving=True):
+        p.add_argument("-m", "--model", default=None, help="model name (./sixi models) or a GGUF file; default: the registry default")
+        p.add_argument("--host", default="127.0.0.1")
+        p.add_argument("--port", type=int, default=DEFAULT_PORT)
+        p.add_argument("--api-key", default=os.environ.get("SIXI_API_KEY", ""))
+        if serving:
+            p.add_argument("--ctx", type=int, default=0, help="context window in tokens (default: the model's entry, 32768)")
+            p.add_argument("--parallel", type=int, default=1, help="requests decoded at once")
+            p.add_argument("--draft", default="", help="drafter GGUF, when -m is a file")
+            p.add_argument("--reference", action="store_true", help=argparse.SUPPRESS)   # built-in test backend, no model
+            p.set_defaults(extra=[])   # options after `--` go to sixi-server as they are
+
+    def talking(p):
+        p.add_argument("--max-tokens", type=int, default=4096)
+        p.add_argument("--temperature", type=float, default=0.0)
+        p.add_argument("--no-think", action="store_true", help="answer without the reasoning phase")
+        p.add_argument("--system", default="", help="system prompt")
+        p.add_argument("--keep", action="store_true", help="leave the server running afterwards")
+        p.add_argument("-q", "--quiet", action="store_true", help="print the answer only")
+
+    p = sub.add_parser("setup", help="build the engine and its backend")
+    p.add_argument("--jobs", type=int, default=0)
+    p.add_argument("--cuda-arch", default="", help="CUDA architecture (default: 110 on Jetson Thor, native elsewhere)")
+    p.add_argument("--rebuild-backend", action="store_true")
+    p.set_defaults(fn=cmd_setup)
+    p = sub.add_parser("doctor", help="check the installation")
+    common(p, serving=False)
+    p.set_defaults(fn=cmd_doctor)
+    p = sub.add_parser("models", help="models known by name, and which are downloaded")
+    p.set_defaults(fn=cmd_models)
+    p = sub.add_parser("pull", help="download a model")
+    p.add_argument("-m", "--model", default=None)
+    p.add_argument("--dry-run", action="store_true", help="show what would be downloaded")
+    p.add_argument("--no-verify", action="store_true", help="skip the sha256 check")
+    p.set_defaults(fn=cmd_pull)
+    p = sub.add_parser("serve", help="run the OpenAI-compatible server in the foreground")
+    common(p)
+    p.set_defaults(fn=cmd_serve)
+    p = sub.add_parser("chat", help="interactive chat in the terminal")
+    common(p)
+    talking(p)
+    p.set_defaults(fn=cmd_chat)
+    p = sub.add_parser("run", help="one prompt, one answer")
+    p.add_argument("prompt", nargs="*", help="the prompt (or pipe it in)")
+    common(p)
+    talking(p)
+    p.add_argument("--json", action="store_true", help="answer with one JSON object")
+    p.add_argument("--schema", default="", help="answer as JSON matching this JSON schema file")
+    p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("stop", help="stop a server started by chat / run")
+    p.set_defaults(fn=cmd_stop)
+    p = sub.add_parser("service", help="the server as a background service (systemd user unit)")
+    p.add_argument("action", choices=["install", "start", "stop", "restart", "status", "logs", "remove"])
+    common(p)
+    p.add_argument("--boot", action="store_true", help="install: start the service by itself with your session")
+    p.set_defaults(fn=cmd_service, parallel=4)
+    p = sub.add_parser("link", help="put this command on the PATH as `sixi-asi` (~/.local/bin)")
+    p.set_defaults(fn=cmd_link)
+
+    argv = sys.argv[1:]
+    passthrough = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, passthrough = argv[:i], argv[i + 1:]
+    a = ap.parse_args(argv)
+    if not a.cmd:
+        ap.print_help()
+        return
+    if passthrough:
+        a.extra = passthrough
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

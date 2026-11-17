@@ -23,7 +23,7 @@ using namespace sixi_asi;
 namespace {
 
 void print_usage() {
-    std::cout << "SIXI-ASI CLI v0.11.0\n"
+    std::cout << "sixi-cli " SIXI_ASI_VERSION ": manifests, memory planning and hardware probing for the Sixi-ASI Engine\n"
               << "Commands:\n"
               << "  manifest-build --shard <gguf> [--shard <gguf2> ...] --out <file.sixi>\n"
               << "                 [--id <id>] [--drafter <mtp.gguf>] [--neural-drafter none|mtp|dflash2]\n"
@@ -53,6 +53,10 @@ int main(int argc, char** argv) {
     std::string cmd = argv[1];
     if (cmd == "--help" || cmd == "-h") {
         print_usage();
+        return 0;
+    }
+    if (cmd == "--version" || cmd == "-V") {
+        std::cout << "sixi-cli " SIXI_ASI_VERSION "\n";
         return 0;
     }
 

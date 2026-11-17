@@ -615,10 +615,11 @@ Result<SpeculativeStepResult> SpeculativeDecoder::step(
             }
 
             if (greedy) {
-                for (uint32_t i = 0; i <= proposed_k; ++i) {
+                // Rows are read in order and only as far as the drafts hold: an argmax over the vocabulary per
+                // row of a 16-row batch is several milliseconds of host time that the rejected tail does not need.
+                uint32_t i = 0;
+                for (; i < proposed_k; ++i) {
                     next_token[i] = core::DeterministicSampler::sample_greedy_argmax(seq_logits[i].data(), vocab_sz);
-                }
-                for (uint32_t i = 0; i < proposed_k; ++i) {
                     if (cont_tokens[i] == next_token[i]) {
                         step_res.committed_tokens.push_back(cont_tokens[i]);
                         ++step_res.accepted_draft_count;
@@ -626,6 +627,9 @@ Result<SpeculativeStepResult> SpeculativeDecoder::step(
                         record_rejection(i);
                         break;
                     }
+                }
+                if (i == proposed_k) {
+                    next_token[proposed_k] = core::DeterministicSampler::sample_greedy_argmax(seq_logits[proposed_k].data(), vocab_sz);
                 }
             } else {
                 // Lossless speculative rejection sampling against the exact AR sampling distribution.

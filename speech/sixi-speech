@@ -1,0 +1,666 @@
+#!/usr/bin/env python3
+"""sixi-speech: speech recognition and speech synthesis next to the Sixi-ASI Engine, on the CPU.
+
+The engine uses the GPU for the language model; speech runs on CPU cores so that it does not slow the answers
+down. The service speaks the OpenAI audio API, so one client covers text, images and speech:
+
+  POST /v1/audio/transcriptions   multipart form: file=<audio>, optional language=en|de|..., model=whisper, response_format=json|text
+                                  language=pl|de|it|fr with audio of up to 2 s: a short answer ("nie", "ja") is heard in that
+                                  language and not as English (lead_in=0 in the form turns this off for one request;
+                                  certain=1 returns a text only when it was heard the same way twice, else nothing)
+  POST /v1/audio/speech           JSON: {"input": "...", "voice": "pl", "response_format": "wav"|"pcm"|"mp3"|..., "speed": 1.0}
+                                  "deterministic": true (or "noise_scale": 0, "noise_scale_w": 0): the same audio every time
+  GET  /v1/models, GET /health
+
+Commands:
+
+  sixi-speech setup                 an isolated Python environment under ~/.sixi/speech, the runtime, the models
+  sixi-speech link                  put this command on the PATH (~/.local/bin)
+  sixi-speech serve                 the service in the foreground (http://127.0.0.1:8088)
+  sixi-speech service install       as a systemd user service; then start | stop | restart | status | logs | remove
+  sixi-speech say "Dzien dobry" --voice pl -o out.wav
+  sixi-speech transcribe file.wav
+
+Recognition: NVIDIA Parakeet TDT 0.6b v3 (25 European languages, among them English, German, Italian, French and
+Polish; it detects the language); Whisper turbo for other languages (language=zh) or on request (model=whisper).
+Parakeet has no input for the language, and a word of one syllable is too little for it to tell: with
+language=pl, de, it or fr the service hears a clip of up to 2 s together with a phrase in that language, spoken
+by its own voice (once in front of the clip, once behind it), and takes the phrase off the text again. Give the
+language whenever you know it. Where a wrong word is worse than no answer, add certain=1.
+Synthesis: Piper voices, one per language: en, de, it, fr, pl, pl-female (or the name of a voice folder). Both run
+through sherpa-onnx on the CPU.
+
+The log (stdout; ~/.sixi/speech/service.log for the systemd service) has one line per request with the audio
+length, the time taken, the model or voice and the number of characters. It holds no recognised or spoken text
+unless the service is started with --log-text (or SIXI_SPEECH_LOG_TEXT=1), which is meant for debugging only.
+"""
+import argparse
+import io
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import wave
+
+HOME = os.path.expanduser(os.environ.get("SIXI_HOME", "~/.sixi"))
+SPEECH = os.path.join(HOME, "speech")
+MODELS = os.path.join(SPEECH, "models")
+VENV_PY = os.path.join(SPEECH, "venv", "bin", "python")
+LOG = os.path.join(SPEECH, "service.log")
+UNIT = "sixi-speech.service"
+UNIT_PATH = os.path.expanduser(os.path.join("~/.config/systemd/user", UNIT))
+RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+STT_DIR = "sherpa-onnx-whisper-turbo"                         # multilingual fallback (Chinese, Japanese, ...)
+PARAKEET_DIR = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"   # NVIDIA Parakeet TDT 0.6b v3: 25 European languages, fast on a CPU
+PARAKEET_URL = "https://huggingface.co/csukuangfj/" + PARAKEET_DIR + "/resolve/main/"
+PARAKEET_FILES = ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"]
+PARAKEET_LANGS = {"bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk",
+                  "sl", "es", "sv", "ru", "uk"}
+VOICES = {   # name -> voice folder (Piper voices packaged for sherpa-onnx)
+    "pl": "vits-piper-pl_PL-darkman-medium",
+    "pl-female": "vits-piper-pl_PL-zenski_wg_glos-medium",
+    "en": "vits-piper-en_US-lessac-medium",
+    "de": "vits-piper-de_DE-thorsten-medium",
+    "fr": "vits-piper-fr_FR-siwis-medium",
+    "it": "vits-piper-it_IT-paola-medium",
+}
+# A phrase in the language, spoken by the service's own voice and put in front of a short clip before Parakeet
+# hears it. Parakeet has no input for the language: it decides from the audio, and takes a one-syllable word in
+# another language for English (a Polish "nie" comes back as "Yeah."). With the phrase in front it stays in the
+# language; the phrase is taken off the text again. English needs none.
+# The join can cost the clip its first sound ("Stop." after the phrase comes back as "Top."). So the clip is heard
+# a second time with another phrase behind it, where its start is the start of the audio; when the two texts end
+# alike and begin differently, the beginning is taken from that second one.
+LEAD_IN = {     # language -> (phrase in front, phrase behind, voices to say them with: the first installed one)
+    "pl": ("Odpowiedź brzmi:", "Tak brzmi moja odpowiedź.", ("pl-female", "pl")),
+    "de": ("Die Antwort lautet:", "So lautet meine Antwort.", ("de",)),
+    "it": ("La risposta è:", "Questa è la mia risposta.", ("it",)),
+    "fr": ("La réponse est :", "C'est ma réponse.", ("fr",)),
+}
+LEAD_IN_MAX_S = 2.0     # longer audio carries enough of its language by itself
+DOWNLOADS = ["asr-models/" + STT_DIR + ".tar.bz2", "asr-models/silero_vad.onnx"] + ["tts-models/" + v + ".tar.bz2" for v in VOICES.values()]
+
+
+def die(msg):
+    print("sixi-speech: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------------------------------------ setup
+
+def cmd_setup(a):
+    os.makedirs(MODELS, exist_ok=True)
+    if not os.path.isfile(VENV_PY):
+        print("== Python environment: " + os.path.join(SPEECH, "venv"))
+        subprocess.check_call([sys.executable, "-m", "venv", os.path.join(SPEECH, "venv")])
+    # sherpa-onnx 1.x: version 2 no longer turns text into phonemes for Piper voices by itself
+    print("== runtime (sherpa-onnx 1.x, numpy)")
+    subprocess.check_call([VENV_PY, "-m", "pip", "install", "--quiet", "sherpa-onnx>=1.12,<2", "numpy"])
+    if not shutil.which("ffmpeg"):
+        print("   ffmpeg is not installed: only WAV input and WAV / PCM output will work (Ubuntu: sudo apt install ffmpeg)")
+    for rel in DOWNLOADS:
+        name = os.path.basename(rel)
+        folder = os.path.join(MODELS, name[:-len(".tar.bz2")]) if name.endswith(".tar.bz2") else None
+        dest = os.path.join(MODELS, name)
+        if (folder and os.path.isdir(folder)) or (not folder and os.path.isfile(dest)):
+            print("   have " + name)
+            continue
+        print("== " + name)
+        tmp = dest + ".part"
+        with urllib.request.urlopen(RELEASES + rel, timeout=60) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+        os.replace(tmp, dest)
+        if folder:
+            subprocess.check_call(["tar", "xjf", dest, "-C", MODELS])
+            os.remove(dest)
+    os.makedirs(os.path.join(MODELS, PARAKEET_DIR), exist_ok=True)
+    for name in PARAKEET_FILES:
+        dest = os.path.join(MODELS, PARAKEET_DIR, name)
+        if os.path.isfile(dest):
+            continue
+        print("== " + PARAKEET_DIR + "/" + name)
+        with urllib.request.urlopen(PARAKEET_URL + name, timeout=60) as r, open(dest + ".part", "wb") as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+        os.replace(dest + ".part", dest)
+    print("\nready: sixi-speech serve   (or: sixi-speech service install && sixi-speech service start)")
+
+
+def need_env():
+    if not os.path.isfile(VENV_PY) or not os.path.isfile(os.path.join(MODELS, PARAKEET_DIR, "encoder.int8.onnx")):
+        die("not set up yet: run sixi-speech setup")
+
+
+# ------------------------------------------------------------------------------------------------ audio helpers
+
+def wav_to_float_16k(data):
+    """A PCM WAV file -> float32 samples at 16 kHz, mono (any rate, 8/16/24/32 bit, any channel count), or None."""
+    import numpy as np
+    try:
+        with wave.open(io.BytesIO(data)) as w:
+            width, rate, channels = w.getsampwidth(), w.getframerate(), w.getnchannels()
+            raw = w.readframes(w.getnframes())
+    except (wave.Error, EOFError):
+        return None
+    if width == 1:
+        x = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif width == 2:
+        x = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    elif width == 3:
+        b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        x = ((b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)) << 8 >> 8).astype(np.float32) / 8388608.0
+    elif width == 4:
+        x = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        return None
+    if channels > 1:
+        x = x[: len(x) // channels * channels].reshape(-1, channels).mean(axis=1)
+    if rate != 16000 and len(x) > 1:
+        n = int(round(len(x) * 16000.0 / rate))
+        x = np.interp(np.linspace(0.0, len(x) - 1.0, n), np.arange(len(x)), x).astype(np.float32)
+    return x
+
+
+def to_float_mono_16k(data):
+    """Any audio file -> float32 samples at 16 kHz, mono. PCM WAV is read directly, everything else by ffmpeg."""
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        x = wav_to_float_16k(data)
+        if x is not None:
+            return x
+    if not shutil.which("ffmpeg"):
+        raise ValueError("this audio needs ffmpeg (send a PCM WAV file, or install ffmpeg)")
+    p = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "wav", "-c:a", "pcm_s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
+                       input=data, capture_output=True)
+    at = p.stdout.find(b"data")
+    if p.returncode != 0 or at < 0:
+        raise ValueError("the audio could not be decoded: " + p.stderr.decode("utf-8", "replace").strip()[:200])
+    import numpy as np
+    pcm = p.stdout[at + 8:]
+    return np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype="<i2").astype(np.float32) / 32768.0
+
+
+def wav_bytes(samples, rate):
+    import numpy as np
+    pcm = (np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return out.getvalue(), pcm
+
+
+def plain_words(text):
+    """Lower case, no punctuation, no diacritics: for comparing what was heard with what was said."""
+    import re
+    import unicodedata
+    t = " ".join(re.sub(r"[^\w\s']", " ", text.lower()).split()).replace("ł", "l")
+    return "".join(c for c in unicodedata.normalize("NFD", t) if unicodedata.category(c) != "Mn")
+
+
+def without_phrase(heard, phrase, behind=False):
+    """The text that follows the phrase (or, with behind, the text in front of it); None when the phrase is not
+    at that end of the text."""
+    import difflib
+    words = heard.split()
+    target = plain_words(phrase)
+    best_k, best = 0, 0.0
+    for k in range(0, min(len(words), 2 * len(target.split()) + 2) + 1):
+        part = words[len(words) - k:] if behind else words[:k]
+        r = difflib.SequenceMatcher(None, plain_words(" ".join(part)), target).ratio()
+        if r > best:
+            best_k, best = k, r
+    if best < 0.7:
+        return None
+    rest = " ".join(words[:len(words) - best_k] if behind else words[best_k:]).strip()
+    if behind and rest:
+        rest = rest.rstrip(" ,;:")
+        rest += "" if rest[-1:] in ".!?" else "."
+    return rest[:1].upper() + rest[1:]
+
+
+def same_end(a, b):
+    """Two different texts that end alike (three letters or more, most of the longer one): the same words with
+    another beginning."""
+    x, y = plain_words(a), plain_words(b)
+    if not x or not y or x == y:
+        return False
+    n = 0
+    while n < min(len(x), len(y)) and x[-1 - n] == y[-1 - n]:
+        n += 1
+    return n >= 3 and n >= 0.6 * max(len(x), len(y))
+
+
+# ------------------------------------------------------------------------------------------------ the service
+
+class Speech:
+    def __init__(self, stt_threads, tts_threads, lead_in=True):
+        import sherpa_onnx
+        self.so = sherpa_onnx
+        self.stt_threads = stt_threads
+        self.tts_threads = tts_threads
+        self.use_lead_in = lead_in
+        self.leads = {}        # language -> (phrase in front as 16 kHz samples, its text, phrase behind, its text) or None
+        self.leads_lock = threading.Lock()
+        self.stt = {}          # language ("" = detect) -> recognizer
+        self.stt_lock = threading.Lock()
+        self.tts = {}          # voice folder -> (tts, lock)
+        self.tts_lock = threading.Lock()
+        self.vad_lock = threading.Lock()
+        d = os.path.join(MODELS, PARAKEET_DIR)
+        self.parakeet = self.so.OfflineRecognizer.from_transducer(
+            encoder=os.path.join(d, "encoder.int8.onnx"), decoder=os.path.join(d, "decoder.int8.onnx"),
+            joiner=os.path.join(d, "joiner.int8.onnx"), tokens=os.path.join(d, "tokens.txt"), num_threads=stt_threads,
+            model_type="nemo_transducer")
+
+    def recognizer(self, language):
+        with self.stt_lock:
+            if language not in self.stt:
+                if len(self.stt) >= 3 and language != "":
+                    language = ""      # keep memory bounded: more languages share the detecting recognizer
+                else:
+                    d = os.path.join(MODELS, STT_DIR)
+                    self.stt[language] = self.so.OfflineRecognizer.from_whisper(
+                        encoder=os.path.join(d, "turbo-encoder.int8.onnx"), decoder=os.path.join(d, "turbo-decoder.int8.onnx"),
+                        tokens=os.path.join(d, "turbo-tokens.txt"), language=language, task="transcribe",
+                        num_threads=self.stt_threads)
+            return self.stt[language]
+
+    def segments(self, samples):
+        """Whisper reads up to 30 s at a time: longer audio is cut at pauses."""
+        if len(samples) <= 28 * 16000:
+            return [samples]
+        vad_model = os.path.join(MODELS, "silero_vad.onnx")
+        if not os.path.isfile(vad_model):
+            return [samples[i:i + 28 * 16000] for i in range(0, len(samples), 28 * 16000)]
+        cfg = self.so.VadModelConfig()
+        cfg.silero_vad.model = vad_model
+        cfg.silero_vad.min_silence_duration = 0.4
+        cfg.silero_vad.max_speech_duration = 25.0
+        cfg.sample_rate = 16000
+        out = []
+        with self.vad_lock:
+            vad = self.so.VoiceActivityDetector(cfg, buffer_size_in_seconds=120)
+            win = cfg.silero_vad.window_size
+            for i in range(0, len(samples), win):
+                vad.accept_waveform(samples[i:i + win])
+                while not vad.empty():
+                    out.append(vad.front.samples)
+                    vad.pop()
+            vad.flush()
+            while not vad.empty():
+                out.append(vad.front.samples)
+                vad.pop()
+        return out or [samples]
+
+    def lead_in(self, language):
+        """The phrases of a language as (in front: samples at 16 kHz, text; behind: samples, text), or None: the
+        language has none, or none of their voices is installed."""
+        with self.leads_lock:
+            if language not in self.leads:
+                self.leads[language] = None
+                front, behind, voices = LEAD_IN.get(language, ("", "", ()))
+                for v in voices:
+                    folder = VOICES.get(v, v)
+                    if not os.path.isdir(os.path.join(MODELS, folder)):
+                        continue
+                    key = (folder, (0.0, 0.0))
+                    had = key in self.tts
+                    spoken = []
+                    for phrase in (front, behind):
+                        samples, rate = self.speak(phrase, v, 1.0, (0.0, 0.0))     # without noise: the same audio every time
+                        wav, _ = wav_bytes(samples, rate)
+                        spoken += [wav_to_float_16k(wav), phrase]
+                    if not had:
+                        with self.tts_lock:
+                            self.tts.pop(key, None)     # this copy of the voice was loaded for the phrases only
+                    self.leads[language] = tuple(spoken)
+                    break
+            return self.leads[language]
+
+    def with_lead_in(self, samples, lead, certain=False):
+        """Parakeet on phrase + clip, and on clip + phrase where the first says something; the clip's text, or
+        None when the phrase in front did not come back (the caller then recognises the clip as it is).
+        certain: a text only when both ways heard the same words, else nothing."""
+        import numpy as np
+        front, front_text, behind, behind_text = lead
+        clip = np.asarray(samples, dtype=np.float32)
+        clip = clip * min((float(np.max(np.abs(front))) or 1.0) / float(np.max(np.abs(clip))), 8.0)     # at the loudness of the phrases
+        gap = (np.random.default_rng(7).standard_normal(int(0.15 * 16000)) * 1e-4).astype(np.float32)
+
+        def hear(parts):
+            with self.stt_lock:
+                s = self.parakeet.create_stream()
+                s.accept_waveform(16000, np.concatenate(parts))
+                self.parakeet.decode_stream(s)
+                return s.result.text.strip()
+
+        text = without_phrase(hear([front, gap, clip]), front_text)
+        if not text:
+            return text      # None: phrase not found; "": nothing was said after it
+        second = without_phrase(hear([clip, gap, behind]), behind_text, behind=True)
+        if second and same_end(second, text):
+            return second
+        if certain and plain_words(second or "") != plain_words(text):
+            return ""
+        return text
+
+    def transcribe(self, samples, language, model="", lead_in=True, certain=False):
+        # Parakeet for the languages it knows (it detects which one); Whisper for the others, or when asked for
+        use_whisper = model.startswith("whisper") or (language and language not in PARAKEET_LANGS)
+        if use_whisper and not os.path.isdir(os.path.join(MODELS, STT_DIR)):
+            raise ValueError("language '%s' needs the Whisper model, which is not installed (sixi-speech setup)" % language)
+        import numpy as np
+        if len(samples) == 0 or float(np.max(np.abs(samples))) < 1e-3:
+            # nothing above -60 dBFS: no recogniser is asked (Whisper writes a sentence for silence, Parakeet "Uh")
+            return "", "", "no sound"
+        if not use_whisper and lead_in and self.use_lead_in and len(samples) <= LEAD_IN_MAX_S * 16000:
+            lead = self.lead_in(language)
+            text = self.with_lead_in(samples, lead, certain) if lead else None
+            if text is not None:
+                return text, language, "parakeet with phrases, certain" if certain else "parakeet with phrases"
+        rec = self.recognizer(language or "") if use_whisper else self.parakeet
+        texts = []
+        lang = ""
+        for seg in self.segments(samples):
+            with self.stt_lock:
+                s = rec.create_stream()
+                s.accept_waveform(16000, seg)
+                rec.decode_stream(s)
+                texts.append(s.result.text.strip())
+                lang = getattr(s.result, "lang", "") or lang
+        return " ".join(t for t in texts if t), lang, "whisper" if use_whisper else "parakeet"
+
+    def voice(self, name, noise=None):
+        """noise: None for the voice as published, or (noise_scale, noise_scale_w). A Piper voice draws random
+        noise for its timbre and for the length of each sound, so the same sentence is different audio every
+        time; with both scales at 0 it is the same audio every time (and a little flatter)."""
+        folder = VOICES.get(name, name)
+        d = os.path.join(MODELS, folder)
+        if not os.path.isdir(d):
+            return None
+        key = (folder, noise)
+        with self.tts_lock:
+            if key not in self.tts:
+                onnx = [f for f in os.listdir(d) if f.endswith(".onnx")]
+                if not onnx:
+                    return None
+                scales = {} if noise is None else {"noise_scale": noise[0], "noise_scale_w": noise[1]}
+                vits = self.so.OfflineTtsVitsModelConfig(model=os.path.join(d, onnx[0]), lexicon="", tokens=os.path.join(d, "tokens.txt"),
+                                                         data_dir=os.path.join(d, "espeak-ng-data"), **scales)
+                model = self.so.OfflineTtsModelConfig(vits=vits, num_threads=self.tts_threads, provider="cpu")
+                # every setting of the scales is one more loaded copy of the voice: keep a few
+                variants = [k for k in self.tts if k[1] is not None]
+                if noise is not None and len(variants) >= 6:
+                    del self.tts[variants[0]]
+                self.tts[key] = (self.so.OfflineTts(self.so.OfflineTtsConfig(model=model, max_num_sentences=1)), threading.Lock())
+            return self.tts[key]
+
+    def speak(self, text, voice, speed, noise=None):
+        v = self.voice(voice, noise)
+        if v is None:
+            raise ValueError("unknown voice '%s' (have: %s)" % (voice, ", ".join(sorted(VOICES))))
+        tts, lock = v
+        with lock:
+            audio = tts.generate(text, sid=0, speed=speed)
+        return audio.samples, audio.sample_rate
+
+
+def parse_multipart(content_type, body):
+    """-> {field: (filename or None, bytes)} for a multipart/form-data body."""
+    import email.parser
+    import email.policy
+    msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+        b"Content-Type: " + content_type.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + body)
+    out = {}
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if name:
+            out[name] = (part.get_filename(), part.get_payload(decode=True) or b"")
+    return out
+
+
+def cmd_serve(a):
+    need_env()
+    if os.path.realpath(sys.prefix) != os.path.realpath(os.path.join(SPEECH, "venv")) and not os.environ.get("SIXI_SPEECH_IN_VENV"):
+        os.execve(VENV_PY, [VENV_PY, os.path.abspath(__file__)] + sys.argv[1:], dict(os.environ, SIXI_SPEECH_IN_VENV="1"))
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    t0 = time.time()
+    speech = Speech(a.stt_threads, a.tts_threads, lead_in=not a.no_lead_in)
+    for name in VOICES:      # load every installed voice now: the first sentence in a language should not wait for it
+        speech.voice(name)
+    if not a.no_lead_in:
+        for language in LEAD_IN:
+            speech.lead_in(language)
+    # What a person says and hears stays out of the log unless it is asked for: the log is a file other processes can read.
+    log_text = a.log_text or os.environ.get("SIXI_SPEECH_LOG_TEXT", "").strip().lower() in ("1", "true", "yes", "on")
+    print("sixi-speech: models loaded in %.1f s; listening on http://%s:%d; request text in this log: %s"
+          % (time.time() - t0, a.host, a.port, "ON (--log-text or SIXI_SPEECH_LOG_TEXT)" if log_text else "off"), flush=True)
+
+    def log_request(line, text, shown):
+        print(line + ": %d chars" % len(text) + (" | " + text[:shown] if log_text else ""), flush=True)
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            pass
+
+        def reply(self, code, body, ctype="application/json"):
+            if isinstance(body, (dict, list)):
+                body = json.dumps(body, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def error(self, code, msg):
+            self.reply(code, {"error": {"message": msg, "type": "invalid_request_error" if code < 500 else "server_error"}})
+
+        def do_GET(self):
+            if self.path == "/health":
+                self.reply(200, {"status": "ok", "stt": "parakeet-tdt-0.6b-v3 (whisper-turbo for other languages)", "voices": sorted(VOICES)})
+            elif self.path == "/v1/models":
+                self.reply(200, {"object": "list", "data": [{"id": "parakeet-tdt-0.6b-v3", "object": "model"}, {"id": "whisper-turbo", "object": "model"}, {"id": "piper", "object": "model"}]})
+            else:
+                self.error(404, "not found")
+
+        def do_POST(self):
+            try:
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if self.path == "/v1/audio/transcriptions":
+                    form = parse_multipart(self.headers.get("Content-Type", ""), body)
+                    if "file" not in form:
+                        return self.error(400, "multipart field 'file' is missing")
+                    language = form.get("language", (None, b""))[1].decode().strip().lower()
+                    fmt = form.get("response_format", (None, b"json"))[1].decode().strip() or "json"
+                    t = time.time()
+                    samples = to_float_mono_16k(form["file"][1])
+                    lead_in = form.get("lead_in", (None, b"1"))[1].decode().strip().lower() not in ("0", "false", "no", "off")
+                    certain = form.get("certain", (None, b"0"))[1].decode().strip().lower() in ("1", "true", "yes", "on")
+                    text, lang, used = speech.transcribe(samples, language, form.get("model", (None, b""))[1].decode().strip().lower(), lead_in, certain)
+                    took = time.time() - t
+                    log_request("stt %.2f s audio in %.2f s (%s%s)" % (len(samples) / 16000.0, took, used, ", " + (lang or language) if (lang or language) else ""), text, 80)
+                    if fmt == "text":
+                        return self.reply(200, text.encode(), "text/plain; charset=utf-8")
+                    out = {"text": text}
+                    if fmt == "verbose_json":
+                        out.update({"language": lang or language, "duration": len(samples) / 16000.0, "processing_s": took})
+                    return self.reply(200, out)
+                if self.path == "/v1/audio/speech":
+                    j = json.loads(body or b"{}")
+                    text = (j.get("input") or "").strip()
+                    if not text:
+                        return self.error(400, "'input' is empty")
+                    voice = j.get("voice") or a.default_voice
+                    if voice not in VOICES and not os.path.isdir(os.path.join(MODELS, voice)):
+                        voice = a.default_voice      # OpenAI voice names (alloy, ...) map to the default voice
+                    fmt = (j.get("response_format") or "wav").lower()
+                    # the same audio for the same text: "deterministic": true, or the two noise scales themselves
+                    noise = None
+                    if j.get("deterministic") or j.get("noise_scale") is not None or j.get("noise_scale_w") is not None:
+                        noise = (0.0, 0.0) if j.get("deterministic") else (
+                            float(j["noise_scale"] if j.get("noise_scale") is not None else 0.667),
+                            float(j["noise_scale_w"] if j.get("noise_scale_w") is not None else 0.8))
+                        if not all(0.0 <= x <= 2.0 for x in noise):
+                            return self.error(400, "'noise_scale' and 'noise_scale_w' must be between 0 and 2")
+                    t = time.time()
+                    samples, rate = speech.speak(text, voice, float(j.get("speed") or 1.0), noise)
+                    wav, pcm = wav_bytes(samples, rate)
+                    log_request("tts %.2f s audio in %.2f s (%s%s)" % (len(samples) / float(rate), time.time() - t, voice,
+                                                                      "" if noise is None else ", noise %g/%g" % noise), text, 60)
+                    if fmt == "wav":
+                        return self.reply(200, wav, "audio/wav")
+                    if fmt == "pcm":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "audio/pcm")
+                        self.send_header("X-Sample-Rate", str(rate))
+                        self.send_header("Content-Length", str(len(pcm)))
+                        self.end_headers()
+                        self.wfile.write(pcm)
+                        return None
+                    codec = {"mp3": ("mp3", "audio/mpeg"), "opus": ("ogg", "audio/ogg"), "flac": ("flac", "audio/flac"), "aac": ("adts", "audio/aac")}.get(fmt)
+                    if codec is None or not shutil.which("ffmpeg"):
+                        return self.error(400, "response_format must be wav or pcm" + (", mp3, opus, flac, aac" if shutil.which("ffmpeg") else " (ffmpeg is not installed)"))
+                    args = ["ffmpeg", "-v", "error", "-f", "wav", "-i", "pipe:0"] + (["-c:a", "libopus"] if fmt == "opus" else []) + ["-f", codec[0], "pipe:1"]
+                    p = subprocess.run(args, input=wav, capture_output=True)
+                    if p.returncode != 0:
+                        return self.error(500, "encoding failed: " + p.stderr.decode("utf-8", "replace")[:200])
+                    return self.reply(200, p.stdout, codec[1])
+                return self.error(404, "not found")
+            except ValueError as e:
+                return self.error(400, str(e))
+            except Exception as e:  # noqa: BLE001 - a request must not take the service down
+                return self.error(500, "%s: %s" % (type(e).__name__, e))
+
+    ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
+
+
+# ------------------------------------------------------------------------------------------------ client helpers
+
+def cmd_say(a):
+    req = urllib.request.Request("http://%s:%d/v1/audio/speech" % (a.host, a.port),
+                                 json.dumps({"input": " ".join(a.text), "voice": a.voice, "response_format": "wav", "speed": a.speed}).encode(),
+                                 {"Content-Type": "application/json"})
+    t = time.time()
+    data = urllib.request.urlopen(req, timeout=120).read()
+    with open(a.out, "wb") as f:
+        f.write(data)
+    print("%s: %.1f s of audio in %.2f s" % (a.out, (len(data) - 44) / 2.0 / struct.unpack("<I", data[24:28])[0], time.time() - t))
+
+
+def cmd_transcribe(a):
+    boundary = "sixispeech%d" % int(time.time() * 1000)
+    with open(a.file, "rb") as f:
+        audio = f.read()
+    parts = b"--" + boundary.encode() + b"\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio\"\r\n\r\n" + audio + b"\r\n"
+    if a.language:
+        parts += b"--" + boundary.encode() + b"\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n" + a.language.encode() + b"\r\n"
+    parts += b"--" + boundary.encode() + b"--\r\n"
+    req = urllib.request.Request("http://%s:%d/v1/audio/transcriptions" % (a.host, a.port), parts,
+                                 {"Content-Type": "multipart/form-data; boundary=" + boundary})
+    t = time.time()
+    out = json.loads(urllib.request.urlopen(req, timeout=300).read())
+    print(out.get("text", out))
+    print("(%.2f s)" % (time.time() - t), file=sys.stderr)
+
+
+# ------------------------------------------------------------------------------------------------ service
+
+def cmd_service(a):
+    def systemctl(*args, check=True):
+        r = subprocess.run(["systemctl", "--user", *args])
+        if check and r.returncode != 0:
+            die("systemctl --user %s failed" % " ".join(args))
+    if a.action == "install":
+        need_env()
+        os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
+        cmd = [VENV_PY, os.path.abspath(__file__), "serve", "--host", a.host, "--port", str(a.port), "--stt-threads", str(a.stt_threads),
+               "--tts-threads", str(a.tts_threads), "--default-voice", a.default_voice] + (["--log-text"] if a.log_text else []) + (["--no-lead-in"] if a.no_lead_in else [])
+        with open(UNIT_PATH, "w") as f:
+            f.write("\n".join(["[Unit]", "Description=sixi-speech: speech recognition and synthesis on %s:%d" % (a.host, a.port), "After=network.target", "",
+                               "[Service]", "ExecStart=" + " ".join(cmd), "Environment=SIXI_HOME=" + HOME, "Environment=SIXI_SPEECH_IN_VENV=1",
+                               "StandardOutput=append:" + LOG, "StandardError=append:" + LOG, "Restart=on-failure", "RestartSec=5", "",
+                               "[Install]", "WantedBy=default.target", ""]))
+        systemctl("daemon-reload")
+        if a.boot:
+            systemctl("enable", UNIT)
+        print("installed %s\n  sixi-speech service start    then http://%s:%d/v1/audio/..." % (UNIT_PATH, a.host, a.port))
+        print("  log: %s (%s)" % (LOG, "with the start of every recognised and spoken text: --log-text" if a.log_text else "timings only, no request text"))
+        return
+    if not os.path.isfile(UNIT_PATH):
+        die("the service is not installed: sixi-speech service install")
+    if a.action in ("start", "stop", "restart"):
+        systemctl(a.action, UNIT)
+    elif a.action == "status":
+        state = subprocess.run(["systemctl", "--user", "is-active", UNIT], capture_output=True, text=True).stdout.strip()
+        ok = False
+        try:
+            ok = urllib.request.urlopen("http://%s:%d/health" % (a.host, a.port), timeout=2).status == 200
+        except Exception:  # noqa: BLE001
+            pass
+        print("service: %s; http://%s:%d %s" % (state, a.host, a.port, "answers" if ok else "does not answer"))
+        sys.exit(0 if ok else 1)
+    elif a.action == "logs":
+        os.execvp("tail", ["tail", "-n", "60", LOG])
+    elif a.action == "remove":
+        systemctl("disable", "--now", UNIT, check=False)
+        os.remove(UNIT_PATH)
+        systemctl("daemon-reload")
+        print("removed")
+
+
+def cmd_link(a):
+    """Put this command on the PATH: a link in ~/.local/bin."""
+    dest_dir = os.path.expanduser("~/.local/bin")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, "sixi-speech")
+    if os.path.lexists(dest):
+        if not os.path.islink(dest):
+            die(dest + " exists and is not a link: left as it is")
+        os.remove(dest)
+    os.symlink(os.path.abspath(__file__), dest)
+    print(dest + " -> " + os.path.abspath(__file__))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="sixi-speech", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    def net(p):
+        p.add_argument("--host", default="127.0.0.1")
+        p.add_argument("--port", type=int, default=8088)
+
+    def serving(p):
+        net(p)
+        p.add_argument("--stt-threads", type=int, default=6, help="CPU threads for recognition")
+        p.add_argument("--tts-threads", type=int, default=2, help="CPU threads for one synthesis")
+        p.add_argument("--default-voice", default="en", help="voice when a request names none (or an OpenAI voice name)")
+        p.add_argument("--no-lead-in", action="store_true",
+                       help="recognise short clips as they are, without the phrase in their language in front (see LEAD_IN)")
+        p.add_argument("--log-text", action="store_true",
+                       help="debugging: also log the start of every recognised and spoken text (off by default; SIXI_SPEECH_LOG_TEXT=1 does the same)")
+
+    sub.add_parser("setup").set_defaults(fn=cmd_setup)
+    sub.add_parser("link").set_defaults(fn=cmd_link)
+    p = sub.add_parser("serve"); serving(p); p.set_defaults(fn=cmd_serve)
+    p = sub.add_parser("service"); p.add_argument("action", choices=["install", "start", "stop", "restart", "status", "logs", "remove"])
+    serving(p); p.add_argument("--boot", action="store_true"); p.set_defaults(fn=cmd_service)
+    p = sub.add_parser("say"); net(p); p.add_argument("text", nargs="+"); p.add_argument("--voice", default="en")
+    p.add_argument("--speed", type=float, default=1.0); p.add_argument("-o", "--out", default="out.wav"); p.set_defaults(fn=cmd_say)
+    p = sub.add_parser("transcribe"); net(p); p.add_argument("file"); p.add_argument("--language", default=""); p.set_defaults(fn=cmd_transcribe)
+    a = ap.parse_args()
+    if not a.cmd:
+        ap.print_help()
+        return
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

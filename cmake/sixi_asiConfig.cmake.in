@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+find_dependency(OpenSSL)
+if(@SIXI_ASI_WITH_CUDA@)
+    find_dependency(CUDAToolkit)
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/sixi_asiTargets.cmake")
+check_required_components(sixi_asi)

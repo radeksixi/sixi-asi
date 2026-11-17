@@ -40,29 +40,40 @@ std::optional<int64_t> parse_int(const std::string& s, int64_t lo, int64_t hi) {
 
 void usage() {
     std::cout <<
+        "sixi-server " SIXI_ASI_VERSION ": OpenAI-compatible server of the Sixi-ASI Engine\n"
         "sixi-server [options]\n"
+        "  --version               print the version and exit\n"
         "  --manifest PATH         .sixi manifest (model path, drafter, planner inputs)\n"
         "  --model PATH            GGUF model (overrides manifest shard 0)\n"
         "  --draft-model PATH      external DFlash2 drafter GGUF (default: manifest drafter_gguf_path)\n"
         "  --mtp-model PATH        external MTP-head GGUF when the main GGUF has no NextN layer (Flash-Next mtp-*.gguf)\n"
+        "  --mtp-draft-vocab PATH  token-id list the external MTP head drafts from (configs/draft_vocab/, scripts/draft_vocab.py);\n"
+        "                          the target still verifies every token, so answers do not change\n"
         "  --host H --port P       bind address (default 127.0.0.1:8089)\n"
         "  --ctx N                 context window (default 4096)\n"
         "  --n-batch N             prefill batch size (default 2048)\n"
         "  --threads N             CPU threads for the backend (default 8)\n"
         "  --gpu-layers N          layers offloaded to GPU (default 999)\n"
         "  --spec-k N              draft tokens per step (default: min(backend rollback window, 7))\n"
+        "  --reserve-interactive N slots that requests with \"priority\": \"background\" never take (default 0); such requests\n"
+        "                          wait for a slot instead of failing, and load their prompts in small chunks\n"
+        "  --mmproj PATH           projector file (mmproj GGUF): accept images as `image_url` parts with data: URIs\n"
+        "  --image-max-tokens N    most rows one image may take (default: the projector's own; fewer rows load faster,\n"
+        "                          more read small text better); --image-min-tokens N the least\n"
         "  --spec-k-max N          upper bound of the acceptance-driven draft length (default 15; block drafters cap at block-1, chained MTP at 4)\n"
         "  --spec-k-fixed          disable acceptance-driven draft length (always --spec-k tokens)\n"
         "  --kv-type T             KV cache type f16|bf16|q8_0|q4_0 (default: library f16; quantized V enables flash-attn)\n"
         "  --no-neural-drafter     suffix drafter only (no MTP / DFlash2)\n"
         "  --no-spec               plain autoregressive decoding (baseline for A/B)\n"
         "  --n-rs-seq N            recurrent snapshot ring depth (default 16, 8 from --parallel 8; bounds O(1) rollback and draft k)\n"
-        "  --device-slots N        device-side prefix snapshot slots (extra sequences; default 4, 0 = host snapshots)\n"
+        "  --device-slots N        prompt states kept on the device for reuse (extra sequences; default 4, 8 from\n"
+        "                          --parallel 4; 0 = host snapshots). All but two can hold the end of a long system\n"
+        "                          prompt: an agent with more roles than that should raise it\n"
         "  --parallel N            parallel streams: N requests decode at once, their forward passes batched\n"
-        "  --wide-copy-gb N        keep a BF16 copy of the quantized weights (up to N GB of memory) for passes of 160+ rows:\n"
+        "                          (default 1; each stream gets its own --ctx tokens; needs a block drafter or --no-spec)\n"
+        "  --wide-copy-gb N        keep a BF16 copy of the quantized weights (up to N GB of memory) for passes of 96+ rows:\n"
         "                          +5% aggregate at 32 streams, +10% document prefill; 36 covers the large matrices of a\n"
         "                          27B model, 54 all of them (default 0 = off)\n"
-        "                          (default 1; each stream gets its own --ctx tokens; needs a block drafter or --no-spec)\n"
         "  --no-gpu-sampler        host argmax instead of the GPU backend sampler\n"
         "  --no-mtp-load           do not create the embedded MTP draft context\n"
         "  --no-prefix-cache       disable cross-request KV/state reuse\n"
@@ -83,6 +94,11 @@ int main(int argc, char** argv) {
     std::string model_path;
     std::string draft_model_path;
     std::string mtp_model_path;
+    std::string mtp_draft_vocab_path; // token-id list for the external MTP head (scripts/draft_vocab.py)
+    std::string mmproj_path;          // projector file: image input
+    uint32_t reserve_interactive = 0; // slots kept free of "priority": "background" requests
+    uint32_t image_min_tokens = 0;
+    uint32_t image_max_tokens = 0;
     std::string model_name;
     std::string host = "127.0.0.1";
     int port = 8089;
@@ -103,6 +119,7 @@ int main(int argc, char** argv) {
     bool n_rs_seq_set = false;
     uint32_t wide_copy_gb = 0; // kept BF16 copy of quantized weights for wide batches (0 = off)
     uint32_t device_slots = 4;
+    bool device_slots_set = false;
     bool gpu_sampler = true;
     bool load_mtp = true;
     bool use_neural_drafter = true;
@@ -136,10 +153,16 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (arg == "--help" || arg == "-h") { usage(); return 0; }
+        else if (arg == "--version" || arg == "-V") { std::cout << "sixi-server " SIXI_ASI_VERSION "\n"; return 0; }
         else if (arg == "--manifest") manifest_path = next();
         else if (arg == "--model") model_path = next();
         else if (arg == "--draft-model") draft_model_path = next();
         else if (arg == "--mtp-model") mtp_model_path = next();
+        else if (arg == "--mtp-draft-vocab") mtp_draft_vocab_path = next();
+        else if (arg == "--mmproj") mmproj_path = next();
+        else if (arg == "--reserve-interactive") reserve_interactive = static_cast<uint32_t>(need_int("--reserve-interactive", next(), 0, 64));
+        else if (arg == "--image-min-tokens") image_min_tokens = static_cast<uint32_t>(need_int("--image-min-tokens", next(), 1, 16384));
+        else if (arg == "--image-max-tokens") image_max_tokens = static_cast<uint32_t>(need_int("--image-max-tokens", next(), 1, 16384));
         else if (arg == "--model-name") model_name = next();
         else if (arg == "--host") host = next();
         else if (arg == "--port") port = static_cast<int>(need_int("--port", next(), 0, 65535));
@@ -168,7 +191,7 @@ int main(int argc, char** argv) {
         else if (arg == "--n-rs-seq") { n_rs_seq = static_cast<uint32_t>(need_int("--n-rs-seq", next(), 0, 32)); n_rs_seq_set = true; }
         else if (arg == "--parallel") parallel = static_cast<uint32_t>(need_int("--parallel", next(), 1, 64));
         else if (arg == "--wide-copy-gb") wide_copy_gb = static_cast<uint32_t>(need_int("--wide-copy-gb", next(), 0, 96));
-        else if (arg == "--device-slots") device_slots = static_cast<uint32_t>(need_int("--device-slots", next(), 0, 16));
+        else if (arg == "--device-slots") { device_slots = static_cast<uint32_t>(need_int("--device-slots", next(), 0, 32)); device_slots_set = true; }
         else if (arg == "--no-gpu-sampler") gpu_sampler = false;
         else if (arg == "--no-mtp-load") load_mtp = false;
         else if (arg == "--no-spec") disable_speculation = true;
@@ -190,6 +213,7 @@ int main(int argc, char** argv) {
     scfg.port = port;
     max_concurrent = std::max(max_concurrent, parallel);
     scfg.max_concurrent_requests = max_concurrent;
+    scfg.reserve_interactive = reserve_interactive;
     scfg.execution_mode = mode;
     scfg.n_ctx = n_ctx;
     scfg.draft_k = spec_k;
@@ -271,7 +295,7 @@ int main(int argc, char** argv) {
         if (wide_copy_gb > 0) {
             // read by the pinned library (patch 0008) when the first wide pass runs
             ::setenv("GGML_CUDA_WEIGHT_CACHE_GB", std::to_string(wide_copy_gb).c_str(), 1);
-            ::setenv("GGML_CUDA_WEIGHT_CACHE_MIN_ROWS", "160", 0);
+            ::setenv("GGML_CUDA_WEIGHT_CACHE_MIN_ROWS", "96", 0);   // measured threshold (benchmarks section 31); 160 left most 32-stream passes on the quantized kernel
             if (wide_copy_gb < 50) {
                 ::setenv("GGML_CUDA_WEIGHT_CACHE_MIN_ELEMS", "64000000", 0);
             }
@@ -281,16 +305,22 @@ int main(int argc, char** argv) {
         lopts.model_path = model_path;
         lopts.draft_model_path = draft_model_path;
         lopts.mtp_model_path = mtp_model_path;
+        lopts.mtp_draft_vocab_path = mtp_draft_vocab_path;
         lopts.n_gpu_layers = gpu_layers;
         lopts.n_ctx = n_ctx;
         lopts.n_batch = n_batch;
         lopts.n_ubatch = n_batch;
         lopts.n_threads = n_threads;
         lopts.kv_type_k = kv_type_k;
+        lopts.mmproj_path = mmproj_path;
+        lopts.image_min_tokens = image_min_tokens;
+        lopts.image_max_tokens = image_max_tokens;
         lopts.kv_type_v = kv_type_v;
         // From 8 streams the shared draft length is 3 (shared_draft_k), and every sequence pays the ring in memory
         // (151 MB per row and sequence for Qwen3.8-27B): 8 deep is ample there, 16 does not fit 32 streams on Thor.
         if (!n_rs_seq_set && parallel >= 8) n_rs_seq = 8;
+        // several requests at once are agents as a rule: roles with their own long system prompts (up to six here)
+        if (!device_slots_set && parallel >= 4) device_slots = 8;
         lopts.n_rs_seq = n_rs_seq;
         lopts.device_snapshot_slots = device_slots;
         lopts.n_streams = parallel;
@@ -341,7 +371,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout << "SIXI-ASI Server listening on http://" << host << ":" << sres.value() << "\n"
+    std::cout << "Sixi-ASI Engine " SIXI_ASI_VERSION " listening on http://" << host << ":" << sres.value()
+              << "  (OpenAI-compatible: POST /v1/chat/completions)\n"
               << "  Model        : " << scfg.manifest.model_name << "\n"
               << "  Backend      : " << backend->backend_name() << "\n"
               << "  Mode         : " << execution_mode_to_string(mode) << "\n"

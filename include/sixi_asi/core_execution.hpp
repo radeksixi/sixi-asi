@@ -182,6 +182,33 @@ public:
     static int32_t sample_from_candidates(const std::vector<Candidate>& cands, DeterministicRng& rng) noexcept;
 };
 
+// Constrained decoding (grammar / JSON schema): see sixi_asi/constraint.hpp for the backend decorator.
+// Logit given to a token the constraint refuses. Finite on purpose: the numeric policy treats Inf as a fault.
+inline constexpr float kMaskedLogit = -1.0e30f;
+
+class ITokenConstraint {
+public:
+    virtual ~ITokenConstraint() = default;
+
+    // May `token` follow the tokens accepted so far?
+    virtual bool allows(int32_t token) = 0;
+    // Advance by one token. A refused token is an error and leaves the state unchanged.
+    virtual Status accept(int32_t token) = 0;
+    // Set every refused token of the row to kMaskedLogit (a scan of the whole vocabulary).
+    virtual Status mask_all(float* logits, uint64_t vocab_size) = 0;
+    virtual std::unique_ptr<ITokenConstraint> clone() const = 0;
+
+    // Make the `keep` highest logits of the row the best allowed tokens (keep = 0: mask every refused token).
+    // Tokens are tried in descending logit order (equal logits: lower id first) and only the refused ones met on
+    // the way are masked, so a row whose best token is allowed costs one pass and one check. When fewer than
+    // `keep` allowed tokens are among the kSearchWidth best, the row keeps those and everything else is masked;
+    // when none is, the whole vocabulary is scanned (greedy decoding, keep = 1, is therefore always exact). A state
+    // that allows no token at all is an error. best_refused: set when the row's best token was refused.
+    static constexpr uint32_t kSearchWidth = 1024;
+    // best_token: with keep = 1, the token the row now ranks first (the best allowed one).
+    Status constrain(float* logits, uint64_t vocab_size, uint32_t keep, bool* best_refused = nullptr, int32_t* best_token = nullptr);
+};
+
 // Backend Execution Interface (Section 4)
 struct BackendSequenceState {
     uint64_t seq_len = 0;
@@ -247,6 +274,9 @@ public:
     // Request setup (prefix-cache restore, rollback, prefill) as one exclusive section: the calling thread keeps the
     // device between its setup operations, so a new request is ready after one wait instead of one per operation
     // (with many streams every wait was a full shared pass, during which the stream was missing from the passes).
+    // The calling thread's request is background work: while it loads a prompt it leaves the device to the
+    // generating streams for longer between chunks.
+    virtual void set_background(bool background) noexcept { (void)background; }
     virtual void begin_setup() noexcept {}
     virtual void end_setup() noexcept {}
     virtual void begin_generation() noexcept {}
@@ -297,6 +327,36 @@ public:
         set_last_sampled_greedy_token(best);
         return Result<int32_t>(best);
     }
+    // Constrained decoding. json_schema_to_grammar: GBNF text for a JSON schema (start symbol "root").
+    // make_grammar_constraint: the state before the first token of a text that must match the grammar; end of
+    // generation is allowed only where the grammar can end. Backends without a grammar engine refuse both.
+    // Image input. An image stands in the token history as a run of "image tokens": ids at or above
+    // kImageTokenBase derived from the image's content, one per position the image occupies. They are never given
+    // to the model as tokens: forward_tokens() decodes the image there instead. Two prompts share a prefix through
+    // an image only if it is the same image, so prefix reuse and snapshots need no special case.
+    static constexpr int32_t kImageTokenBase = 0x40000000;
+    static bool is_image_token(int32_t token) noexcept { return token >= kImageTokenBase; }
+    struct ImageTokens {
+        std::vector<int32_t> tokens;   // what stands in the prompt for the image, the model's image brackets included
+        uint32_t extra_rows = 0;       // context cells the image takes beyond tokens.size()
+    };
+    virtual bool supports_images() const noexcept { return false; }
+    // file_bytes: an image file (jpg, png, bmp, gif). Registers the image and returns its tokens.
+    virtual Result<ImageTokens> prepare_image(const std::string& file_bytes) {
+        (void)file_bytes;
+        return Result<ImageTokens>(ErrorCode::BackendError, "this backend has no image input");
+    }
+
+    virtual Result<std::string> json_schema_to_grammar(const std::string& schema_json) {
+        (void)schema_json;
+        return Result<std::string>(ErrorCode::BackendError, "this backend has no JSON schema converter");
+    }
+    virtual Result<std::unique_ptr<ITokenConstraint>> make_grammar_constraint(const std::string& gbnf, const std::string& root = "root") {
+        (void)gbnf;
+        (void)root;
+        return Result<std::unique_ptr<ITokenConstraint>>(ErrorCode::BackendError, "this backend has no grammar engine");
+    }
+
     virtual Result<std::vector<int32_t>> forward_sequence_greedy_argmax(
         const std::vector<int32_t>& input_tokens) {
         auto res = forward_sequence_all_logits(input_tokens);
@@ -396,7 +456,12 @@ public:
         std::string model_path;
         std::string draft_model_path; // Optional external DFlash2 / draft GGUF path (P2.4)
         std::string mtp_model_path;   // Optional external MTP-head GGUF (e.g. mtp-Qwen3.8-Flash-Next-Q8_0.gguf) when the main GGUF has no NextN layer
+        bool vocab_only = false;      // load the tokenizer only (no weights, no context, no GPU): tokenize / detokenize / grammar constraints work, forward calls do not
+        std::string mtp_draft_vocab_path; // Optional token-id list (one id per line, scripts/draft_vocab.py): the external MTP head scores only these tokens (library patch 0009); empty = env SIXI_MTP_DRAFT_VOCAB, else the whole vocabulary
         std::string ple_shard_path;   // Optional PLE/engram shard path for async PleTableManager prefetch (P0.2)
+        std::string mmproj_path;      // Projector file (mmproj GGUF) for image input; empty = text only
+        uint32_t image_min_tokens = 0;  // bounds on the rows one image takes (0 = the projector's own); fewer rows
+        uint32_t image_max_tokens = 0;  // load faster, more rows read small text better
         PleDescriptor ple_desc{};     // Optional PLE descriptor
         int32_t n_gpu_layers = 999;
         uint32_t n_ctx = 4096;
@@ -528,6 +593,12 @@ public:
         uint32_t prefill_chunk_size = 512) override;
     Result<std::vector<int32_t>> forward_sequence_greedy_argmax(
         const std::vector<int32_t>& input_tokens) override;
+
+    void set_background(bool background) noexcept override;
+    bool supports_images() const noexcept override;
+    Result<ImageTokens> prepare_image(const std::string& file_bytes) override;
+    Result<std::string> json_schema_to_grammar(const std::string& schema_json) override;
+    Result<std::unique_ptr<ITokenConstraint>> make_grammar_constraint(const std::string& gbnf, const std::string& root = "root") override;
 
 private:
     struct Impl;
