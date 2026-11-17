@@ -22,7 +22,7 @@ sixi-asi service install --parallel 4
 |---|---|
 | `sixi-asi service start` | loads the model (8-15 s for Qwen3.8-27B) and serves `http://127.0.0.1:8089/v1` |
 | `sixi-asi service status` | whether the service runs and whether the API answers (exit code 0 when it does) |
-| `sixi-asi service logs` | the server log, `~/.sixi/service.log` |
+| `sixi-asi service logs` | the server log, `~/.sixi/service.log`: start-up, memory and library messages, no text of any request. A log over 64 MB becomes `service.log.1` at the next start. `SIXI_LLAMA_LOG=debug` in the service's environment brings the library's debug lines back |
 | `sixi-asi service restart` | after `service install` with other options |
 | `sixi-asi service stop` | unloads the model and frees its memory |
 | `sixi-asi service remove` | stops the service and deletes the unit |

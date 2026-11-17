@@ -20,7 +20,7 @@ by default. With `--api-key KEY` (or `SIXI_API_KEY`) every endpoint except `/hea
 | images | `content` may be a list of parts: `{"type": "text", "text": "..."}` and `{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}`; see below |
 | `prompt` | a raw prompt instead of `messages`: the chat template is not applied |
 | `max_tokens` (`max_completion_tokens`) | limit on generated tokens, reasoning included; also capped by the context window |
-| `temperature`, `top_k`, `top_p`, `seed` | sampling; `temperature` 0 is greedy. Same seed, same answer |
+| `temperature`, `top_k`, `top_p`, `seed` | sampling; `temperature` 0 is greedy (the default). Same seed, same answer. At `temperature` 1 without `top_p` the model now and then ends its turn at once; `top_p` 0.9 or a lower temperature avoids that |
 | `repetition_penalty`, `presence_penalty` | applied in `--mode adaptive` only; the default strict-replay mode ignores them |
 | `stream` | `true`: server-sent events, ending with `data: [DONE]` |
 | `stop` | a string or a list of strings; the answer ends before the first match |
@@ -86,11 +86,48 @@ loaded model answers: there is no second model.
 
 - An image costs rows of context and loading time in proportion to its size: about 300 rows and 0.6 s for a
   small picture, over 2000 rows and 4 s for a large one. `--image-max-tokens N` bounds the rows per image (512
-  gives about 1.2 s); small text in a picture needs more rows to be read.
+  gives about 1.2 s).
+- The model sees a picture at one row per 32 x 32 pixels, so a small picture is a coarse one: a 480 x 480 picture
+  is 225 rows, and a character 50 pixels wide is covered by two or three of them. To read text or numbers, give
+  the picture more rows: `--image-min-tokens N` enlarges every picture to at least N rows. Measured on fifteen
+  480 x 480 pictures of a six-digit number (`scripts/image_digits_check.py`): 5 read at the picture's own 225
+  rows, 12 with `--image-min-tokens 512`, 14 with `--image-min-tokens 1024 --image-max-tokens 1024` (1.4 s to
+  load a picture instead of 0.4 s). llama.cpp's server reads the same pictures the same way at each setting.
 - An image is part of the prompt prefix like text: the next turn of the same conversation does not load it again
   (first token after about 0.1 s), and the same picture sent by another request is recognised by its content.
 - Requests with images run in parallel streams with requests without; drafts continue after an image.
 - `usage.prompt_tokens` counts the image's rows.
+
+### Prompt reuse
+
+The server keeps what it computed for the prompts it has read; a request whose prompt begins like one of them
+reads only the rest. `usage.prompt_cached_tokens` says how many tokens of the prompt were not read again.
+
+- The next turn of a conversation continues where the last one ended.
+- The end of a long system prompt (512 tokens or more) is kept on its own: every later request with the same
+  system prompt starts from there, whatever follows it and whichever conversation it belongs to. Put what stays
+  the same (the role, the rules, tool definitions) into the system message and what changes into the user message.
+- `--device-slots N` is how many such states are kept: 4, or 8 from `--parallel 4`. All but two of them can hold
+  system prompts, so the default serves six different ones; an agent with more roles than that should raise it
+  (up to 32). A slot costs the memory of one more stream, about 0.9 GB at `--ctx 8192`, and no speed: a single
+  stream decodes as fast with 16 of them as with 4 (`--device-slots 4` is the setting of 1.0.0-rc2).
+
+Measured on a Jetson AGX Thor (`scripts/roles_bench.py`: sessions of three roles, each role with its own
+1,500-token system prompt, a growing conversation and a short JSON answer; `--parallel 8`):
+
+| Sessions at once | 1 | 5 | 8 |
+|---|---|---|---|
+| Seconds a call, 1.0.0-rc2 | 3.4 | 15.7 | 26.8 |
+| Seconds a call, from 1.0.0-rc3 | 1.3 | 4.5 | 6.6 |
+| Calls a second in all, rc2 -> rc3 | 0.29 -> 0.59 | 0.36 -> 1.17 | 0.34 -> 1.24 |
+| Prompt tokens reused, rc2 -> rc3 | 0% -> 86% | 7% -> 86% | 5% -> 86% |
+
+Calls like these are almost all prompt (1,700 tokens in, 20 out), and prompt reading does not get faster with
+more requests at once: what decides their cost is how much of the prompt is still there.
+
+At temperature 0 a call gives the same answer whether its prompt was read or reused, as long as calls come one at
+a time (18 of 18 in the test above). Requests that run at the same time share passes, and a few percent of their
+answers differ in wording from one run to the next with or without reuse (7 to 11 of 90).
 
 ### Priority
 

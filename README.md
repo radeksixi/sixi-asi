@@ -4,7 +4,7 @@ Run Qwen3.8 on an NVIDIA Jetson AGX Thor. An inference engine with speculative d
 unchanged, parallel streams and an OpenAI-compatible API, as one download.
 
 Measured with Qwen3.8-27B on an NVIDIA Jetson AGX Thor: **43 tok/s on one stream** (3.6x plain decoding at 12.1)
-and **172 tok/s in total with 32 requests at once**. [How it was measured](docs/RESULTS.md).
+and **over 170 tok/s in total with 32 requests at once**. [How it was measured](docs/RESULTS.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/streams-dark.svg">
@@ -123,27 +123,33 @@ repositories, sizes and checksums). No model is part of this archive.
 - **Samples and voting.** `n` samples of one prompt cost one prompt load; `"vote": true` returns the majority
   answer and stops the rest once it is decided.
 - **Prompt cache.** A conversation continues from where it stopped, and a repeated prompt starts answering in
-  1 ms; the cache can persist on disk.
+  1 ms; the cache can persist on disk. The end of a long system prompt is kept on its own, so every call of an
+  agent's role starts from there, whichever conversation it belongs to.
+- **Short spoken answers in their language.** With the language in the request, a one-word answer ("nie", "ja",
+  "non") is heard as that language and not as English.
 - **Native Qwen3.8 chat template** (tools, reasoning effort, thinking on/off); reasoning budgets that end the
   reasoning instead of returning an empty answer; tool calls validated against their schema.
 
 ## Performance
 
-NVIDIA Jetson AGX Thor, 1.0.0-rc2, measured on the files of this archive. Full tables, quality gates and the
-comparison with other engines are in [docs/RESULTS.md](docs/RESULTS.md); what changed in each version is in
-[CHANGELOG.md](CHANGELOG.md).
+NVIDIA Jetson AGX Thor, 1.0.0-rc3, measured on the files of this archive; the rows on spoken turns, the next
+turn about a picture and Flash-Next are from 1.0.0-rc2, which rc3 leaves as they were. Full tables, quality gates
+and the comparison with other engines are in [docs/RESULTS.md](docs/RESULTS.md); what changed in each version is
+in [CHANGELOG.md](CHANGELOG.md).
 
 | | |
 |---|---|
-| Qwen3.8-27B, one stream, default weights (UD-Q4_K_XL v3.1) | 43.2 tok/s, 3.6x plain decoding |
+| Qwen3.8-27B, one stream, default weights (UD-Q4_K_XL v3.1) | 43.4 tok/s, 3.6x plain decoding |
 | The same over 60 prompts (math, code, everyday questions) | 54.7 tok/s (1.0.0-rc1: 51.4) |
-| Qwen3.8-27B, 2 / 4 / 8 / 32 requests at once, in total | 70 / 108 / 125 / 172 tok/s |
+| Qwen3.8-27B, 2 / 4 / 8 / 32 requests at once, in total | 72 / 110 / 131 / 183 tok/s |
 | llama.cpp v1.0.0 on the same machine and weights, built-in MTP drafts | 29.3 tok/s |
+| An agent's role call with a 1,500-token system prompt: alone / five sessions at once | 1.3 s / 4.5 s (1.0.0-rc2: 3.4 / 15.7) |
 | 16 agents with an 18k-token prompt each: wait for the next turn | 3 s |
 | JSON answers that parse, with a schema (120 cases) | 118 of 120 (103 without the constraint) |
 | A turn next to four background requests: first token | 0.18-0.26 s |
 | A spoken question to the first audio of the answer (speech on the CPU) | 1.0-1.5 s |
-| A picture: load / next turn about the same picture | 0.6-1.2 s / 0.1 s |
+| One-word spoken answers of Polish speakers heard right, with the language given / without | 201 / 80 of 300 |
+| A picture: load / next turn about the same picture | 0.4-1.4 s / 0.1 s |
 | Qwen3.8-Flash-Next, one stream | 53 tok/s on code, 45 in conversation |
 | Context memory for 32 streams | 27.1 GB |
 | Default weights against BF16 | KL divergence 0.008 |
@@ -158,6 +164,11 @@ python3 scripts/concurrency_bench.py --url http://127.0.0.1:8089 --streams 1,2,4
 python3 scripts/multistream_check.py --url http://127.0.0.1:8089 --streams 4
 python3 scripts/schema_eval.py --url http://127.0.0.1:8089 --compare-free
 python3 scripts/intel_eval.py --engines sixi=http://127.0.0.1:8089 --effort low --max-tokens 8192
+python3 scripts/speed_set.py --url http://127.0.0.1:8089          # one stream over 60 prompts
+python3 scripts/sampling_check.py --url http://127.0.0.1:8089     # the same prompt greedy, then sampled
+python3 scripts/roles_bench.py --url http://127.0.0.1:8089 --sessions 5     # an agent's calls with long system prompts
+python3 scripts/image_digits_check.py --url http://127.0.0.1:8089           # numbers in small pictures
+python3 scripts/speech_short_check.py --url http://127.0.0.1:8088           # one-word spoken answers
 ```
 
 `ab_bench.py` takes several engines (`--engines a=URL,b=URL --reference b`) and compares their answers with the

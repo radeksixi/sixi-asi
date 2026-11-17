@@ -3,6 +3,20 @@
 Versions of the Sixi-ASI Engine, newest first. Numbers are from NVIDIA Jetson AGX Thor; how each was measured is in
 [docs/RESULTS.md](docs/RESULTS.md).
 
+## 1.0.0-rc3
+
+Found in two days of use by an agent that talks and listens (about 4,500 chat requests and 2,600 speech requests,
+none failed):
+
+| Area | Change |
+|---|---|
+| Fix | a request with `temperature` above 0 for a prompt that had been answered at temperature 0 before began its answer with a stray character; with a prompt that demands JSON the answer was that character alone. Sampling now starts from the right numbers in every case (`scripts/sampling_check.py`) |
+| Agents with roles | the end of a long system prompt is kept and reused by every later call with it: three roles with 1,500-token system prompts take 1.3 s a call instead of 3.4 s alone, 4.5 s instead of 15.7 s with five sessions at once, 6.6 s instead of 26.8 s with eight (`scripts/roles_bench.py`). The server keeps 8 prompt states instead of 4 from `--parallel 4` (`--device-slots`) |
+| Logs | the engine's log no longer fills with the library's debug lines (2.1 million lines in two days of use), and a log over 64 MB is set aside at the next start; the speech service's log has timings and character counts only, no recognised or spoken text (`--log-text` turns it on for debugging) |
+| Speech | short answers are heard in their language: with `language=pl`, `de`, `it` or `fr` a clip of up to 2 s is recognised after a phrase in that language (a Polish "nie" used to come back as "Yeah."): 201 instead of 80 of 300 one-word clips of Polish speakers right, 21 instead of 153 wrong; German 126 instead of 41 of 280, French 146 instead of 76 of 317, Italian 76 instead of 38 of 161 (`scripts/speech_short_check.py`). `certain=1` in the request returns a short clip's text only when it was heard the same way twice. Silent audio returns an empty text. `"deterministic": true` in a synthesis request: the same audio for the same text |
+| Images | documented: a small picture needs `--image-min-tokens` for its text to be read (14 of 15 six-digit numbers with 1024 rows, 5 of 15 at the default; `scripts/image_digits_check.py`) |
+| Checks | `scripts/speed_set.py` (single-stream speed over 60 prompts) and the four scripts above are in the archive |
+
 ## 1.0.0-rc2
 
 | Area | Change |
