@@ -822,6 +822,145 @@ bool test_response_format_constrained_answer() {
     return true;
 }
 
+// A client marks a content part with "cache_control": the state at the end of that part is kept as an anchor and
+// survives the prompts that come after it. Also: "draft": false, the usage chunk of a stream, POST /tokenize.
+bool test_cache_marks_usage_chunk_and_tokenize() {
+    using namespace sixi_asi;
+    using namespace sixi_asi::core;
+    using namespace sixi_asi::server;
+
+    ReferenceHybridBackend::Config bcfg;
+    bcfg.vocab_size = 256;
+    bcfg.hidden_size = 64;
+    bcfg.n_layers = 2;
+    bcfg.n_experts = 8;
+    bcfg.top_k = 2;
+    bcfg.enable_fast_rollback_ring = true;
+    bcfg.rollback_ring = 4;
+    bcfg.device_snapshot_slots = 4;
+    auto backend = std::make_shared<ReferenceHybridBackend>(bcfg);
+
+    ServerConfig scfg;
+    scfg.bind_host = "127.0.0.1";
+    scfg.port = 0;
+    scfg.manifest.model_name = "ref";
+    scfg.admission.admitted = true;
+    scfg.n_ctx = 8192;
+    SixiServer server(scfg, backend);
+
+    auto document = [](char c) {
+        std::string d;
+        for (int i = 0; i < 6; ++i) d += std::string("line ") + c + " of a long document that a client reads many times; ";
+        return d;
+    };
+    auto ask = [&](const std::string& doc, const std::string& question, bool mark) {
+        ChatCompletionRequest req;
+        req.messages.push_back(ChatMessage{});
+        req.messages.back().role = "user";
+        req.messages.back().content = doc + question;
+        if (mark) req.messages.back().cache_marks.push_back(doc.size());
+        req.budgets.max_tokens = 4;
+        return server.handle_chat_completion(req);
+    };
+    auto unrelated = [&](int i) {
+        ChatCompletionRequest req;
+        req.messages.push_back(ChatMessage{});
+        req.messages.back().role = "user";
+        req.messages.back().content = "something else number " + std::to_string(i) + " with words enough to be kept as a state of its own";
+        req.budgets.max_tokens = 4;
+        return server.handle_chat_completion(req);
+    };
+
+    // marked document: after other prompts have pushed its last state out, the next question still starts at the mark
+    const std::string doc_a = document('a');
+    auto a1 = ask(doc_a, " First question about it?", true);
+    if (!a1.ok()) std::cout << "  a1: " << a1.message() << "\n";
+    SIXI_ASSERT(a1.ok());
+    SIXI_ASSERT(a1->prompt_cached_tokens == 0);
+    for (int i = 0; i < 4; ++i) SIXI_ASSERT(unrelated(i).ok());
+    auto a2 = ask(doc_a, " A second and different question?", false);
+    SIXI_ASSERT(a2.ok());
+    SIXI_ASSERT(a2->prompt_cached_tokens >= doc_a.size());
+    SIXI_ASSERT(a2->prompt_cached_tokens < a2->prompt_tokens);
+
+    // the same without a mark: nothing of the document is left
+    const std::string doc_b = document('b');
+    auto b1 = ask(doc_b, " First question about it?", false);
+    SIXI_ASSERT(b1.ok());
+    for (int i = 10; i < 14; ++i) SIXI_ASSERT(unrelated(i).ok());
+    auto b2 = ask(doc_b, " A second and different question?", false);
+    SIXI_ASSERT(b2.ok());
+    SIXI_ASSERT(b2->prompt_cached_tokens < 64);
+    // ... and the marked one is still there
+    auto a3 = ask(doc_a, " A third question?", false);
+    SIXI_ASSERT(a3.ok());
+    SIXI_ASSERT(a3->prompt_cached_tokens >= doc_a.size());
+
+    // "draft": false gives the same answer
+    {
+        ChatCompletionRequest req;
+        req.messages.push_back(ChatMessage{});
+        req.messages.back().role = "user";
+        req.messages.back().content = "alpha beta gamma delta epsilon zeta eta theta";
+        req.budgets.max_tokens = 8;
+        auto with = server.handle_chat_completion(req);
+        req.draft = false;
+        auto without = server.handle_chat_completion(req);
+        SIXI_ASSERT(with.ok() && without.ok());
+        SIXI_ASSERT(with->content + with->reasoning_content == without->content + without->reasoning_content);
+    }
+
+    // a stream that asked for it ends with: the last choice, a chunk without choices that carries the usage, [DONE]
+    {
+        ChatCompletionRequest req;
+        req.messages.push_back(ChatMessage{});
+        req.messages.back().role = "user";
+        req.messages.back().content = "one two three four five six seven";
+        req.budgets.max_tokens = 6;
+        req.stream = true;
+        req.stream_include_usage = true;
+        std::vector<std::string> chunks;
+        auto r = server.handle_chat_completion(req, nullptr, [&](const std::string& c) { chunks.push_back(c); return true; });
+        SIXI_ASSERT(r.ok());
+        SIXI_ASSERT(chunks.size() >= 3);
+        SIXI_ASSERT(chunks.back() == "data: [DONE]\n\n");
+        const std::string& usage_chunk = chunks[chunks.size() - 2];
+        SIXI_ASSERT(usage_chunk.find("\"choices\":[]") != std::string::npos);
+        SIXI_ASSERT(usage_chunk.find("\"prompt_tokens_details\"") != std::string::npos);
+        SIXI_ASSERT(usage_chunk.find("\"cached_tokens\"") != std::string::npos);
+        SIXI_ASSERT(chunks[chunks.size() - 3].find("\"finish_reason\"") != std::string::npos);
+        // without the option the stream ends as before
+        req.stream_include_usage = false;
+        chunks.clear();
+        SIXI_ASSERT(server.handle_chat_completion(req, nullptr, [&](const std::string& c) { chunks.push_back(c); return true; }).ok());
+        SIXI_ASSERT(chunks.size() >= 2 && chunks[chunks.size() - 2].find("\"choices\":[]") == std::string::npos);
+    }
+
+    // HTTP: /tokenize, the fields of a request, the usage names of the OpenAI API
+    auto port_res = server.start();
+    SIXI_ASSERT(port_res.ok());
+    const int port = port_res.value();
+    {
+        HttpResponse t = send_http_request(port, "POST", "/tokenize", R"({"content": "hello world"})");
+        SIXI_ASSERT(t.status_code == 200);
+        SIXI_ASSERT(t.body.find("\"count\":11") != std::string::npos);
+        HttpResponse m = send_http_request(port, "POST", "/v1/tokenize", R"({"messages": [{"role": "user", "content": "hello world"}]})");
+        SIXI_ASSERT(m.status_code == 200 && m.body.find("\"count\"") != std::string::npos);
+        SIXI_ASSERT(send_http_request(port, "POST", "/tokenize", R"({"nothing": 1})").status_code == 400);
+
+        HttpResponse c = send_http_request(port, "POST", "/v1/chat/completions",
+            R"({"messages": [{"role": "user", "content": [{"type": "text", "text": "a b c d e f g", "cache_control": {"type": "ephemeral"}}, {"type": "text", "text": " and h?"}]}],)"
+            R"( "max_tokens": 4, "draft": false, "thinking_budget": 16, "stream_options": {"include_usage": true}})");
+        SIXI_ASSERT(c.status_code == 200);
+        SIXI_ASSERT(c.body.find("\"prompt_tokens_details\"") != std::string::npos);
+        SIXI_ASSERT(c.body.find("\"completion_tokens_details\"") != std::string::npos);
+        HttpResponse bad = send_http_request(port, "POST", "/v1/chat/completions", R"({"messages": [{"role": "user", "content": "x"}], "draft": "no"})");
+        SIXI_ASSERT(bad.status_code == 400);
+    }
+    server.stop();
+    return true;
+}
+
 bool test_sixi_asi_server_http_sse_cancellation_concurrency_and_admission() {
     using namespace sixi_asi;
     using namespace sixi_asi::core;
@@ -999,6 +1138,7 @@ int main() {
     RUN_TEST(test_qwen38_template_and_function_call_syntax);
     RUN_TEST(test_prefix_cache_device_slots);
     RUN_TEST(test_response_format_constrained_answer);
+    RUN_TEST(test_cache_marks_usage_chunk_and_tokenize);
     RUN_TEST(test_sixi_asi_server_http_sse_cancellation_concurrency_and_admission);
 
     std::cout << "Summary: " << passed << " passed, " << failed << " failed\n";

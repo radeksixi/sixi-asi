@@ -11,6 +11,7 @@ by default. With `--api-key KEY` (or `SIXI_API_KEY`) every endpoint except `/hea
 | `GET /health` | status, model, context size, chat template, active requests |
 | `GET /metrics` | request counters, last TTFT / TPOT, mean accepted draft length, prefix-cache hits |
 | `POST /apply-template` | the prompt text the chat template renders for a request body, without running it |
+| `POST /tokenize` (`/v1/tokenize`) | `{"content": "..."}` or a body with `messages` (and `tools`, as for a chat request): the token ids and their `count`, without running anything |
 
 ## `POST /v1/chat/completions`
 
@@ -18,15 +19,17 @@ by default. With `--api-key KEY` (or `SIXI_API_KEY`) every endpoint except `/hea
 |---|---|
 | `messages` | `[{"role": "system" \| "user" \| "assistant" \| "tool", "content": "..."}]`; assistant turns may carry `reasoning_content` and `tool_calls`, tool turns `tool_call_id` and `name` |
 | images | `content` may be a list of parts: `{"type": "text", "text": "..."}` and `{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}`; see below |
+| `cache_control` | on a content part (or on a message): keep what was computed up to the end of this part; see "Prompt reuse" |
 | `prompt` | a raw prompt instead of `messages`: the chat template is not applied |
 | `max_tokens` (`max_completion_tokens`) | limit on generated tokens, reasoning included; also capped by the context window |
 | `temperature`, `top_k`, `top_p`, `seed` | sampling; `temperature` 0 is greedy (the default). Same seed, same answer. At `temperature` 1 without `top_p` the model now and then ends its turn at once; `top_p` 0.9 or a lower temperature avoids that |
 | `repetition_penalty`, `presence_penalty` | applied in `--mode adaptive` only; the default strict-replay mode ignores them |
-| `stream` | `true`: server-sent events, ending with `data: [DONE]` |
+| `stream` | `true`: server-sent events, ending with `data: [DONE]`. The last chunk with a choice carries `usage` and `metrics`; with `"stream_options": {"include_usage": true}` one more chunk with an empty `choices` list carries `usage` again, where clients of the OpenAI API look for it |
+| `draft` | `false`: this request is decoded without drafts. For checks: `scripts/exact_check.py` asks every prompt both ways and compares the answers |
 | `stop` | a string or a list of strings; the answer ends before the first match |
 | `enable_thinking` | `false` skips the reasoning phase (also accepted inside `chat_template_kwargs`) |
 | `reasoning_effort`, `preserve_thinking` | passed to the Qwen3.8 chat template |
-| `reasoning_budget_tokens` (`reasoning_budget`) | when the reasoning reaches it, the server closes the reasoning block and the model answers |
+| `reasoning_budget_tokens` (`reasoning_budget`, `thinking_budget`) | when the reasoning reaches it, the server closes the reasoning block and the model answers |
 | `answer_budget_tokens` | limit on answer tokens alone |
 | `response_format` | structured answer, see below |
 | `tools` | OpenAI tool definitions; calls come back validated against their schema as `tool_calls` |
@@ -40,6 +43,14 @@ The response is the OpenAI shape (`choices[0].message.content`, `finish_reason`,
 `choices[0].message.reasoning_content` and a `metrics` object: `ttft_ms`, `tpot_ms`, `prefill_tok_per_s`,
 `decode_tok_per_s`, `mean_acceptance_length` (tokens accepted per speculative step), `prefill_ms`, `snapshot_ms`,
 `reasoning_forced_closed`, `constrained`, `constraint_rows_changed`, `constraint_drafts_refused`.
+
+`usage` has `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_cached_tokens` and `reasoning_tokens`; the
+last two are also there under the names of the OpenAI API, `prompt_tokens_details.cached_tokens` and
+`completion_tokens_details.reasoning_tokens`.
+
+A stream that has nothing to send for 15 seconds (a long prompt is loading, or the request waits behind other
+loads) gets a comment line, `: keep-alive`, so that a proxy on the way does not close the connection; clients of
+server-sent events skip such lines. `--sse-keepalive N` sets the seconds, 0 turns it off.
 
 `finish_reason`: `stop`, `length`, `tool_calls`, `reasoning_budget_exceeded`, `answer_budget_exceeded`,
 `loop_detected`, `cancelled`.
@@ -107,6 +118,25 @@ reads only the rest. `usage.prompt_cached_tokens` says how many tokens of the pr
 - The end of a long system prompt (512 tokens or more) is kept on its own: every later request with the same
   system prompt starts from there, whatever follows it and whichever conversation it belongs to. Put what stays
   the same (the role, the rules, tool definitions) into the system message and what changes into the user message.
+- A client can say where else a state is worth keeping: a content part with `"cache_control": {"type":
+  "ephemeral"}` (the field name that several chat APIs and gateways use for this). The state at
+  the end of that part is kept like the end of a system prompt, so a document or a list of tools inside a user
+  message is read once, and an agent can come back to the conversation as it was at a marked message after later
+  turns have gone another way. Up to four marks a request, in text-only prompts, each at least 256 tokens after the
+  place before it; marked states share the slots of the system prompts.
+
+  ```json
+  {"role": "user", "content": [
+    {"type": "text", "text": "<a long document>", "cache_control": {"type": "ephemeral"}},
+    {"type": "text", "text": "What does section 3 say?"}]}
+  ```
+- Requests with the same prompt that arrive together (several samples asked for as separate requests, agents
+  that start from one document) load it once: the first loads it, the others wait and start from its state.
+- `--merge-loads` (off by default, `--parallel 2` or more): requests with different prompts that arrive at the
+  same moment load them in shared passes. Measured on five and eight requests of 200 to 300 prompt tokens sent at
+  once: all answered after 3.6 and 5.4 s instead of 4.4 and 6.8 s. It gives nothing when calls arrive one after
+  another, and many short prompts get their first token later with it, hence the default. Not for background
+  requests, prompts with images or loads of 1,024 tokens or more.
 - `--device-slots N` is how many such states are kept: 4, or 8 from `--parallel 4`. All but two of them can hold
   system prompts, so the default serves six different ones; an agent with more roles than that should raise it
   (up to 32). A slot costs the memory of one more stream, about 0.9 GB at `--ctx 8192`, and no speed: a single

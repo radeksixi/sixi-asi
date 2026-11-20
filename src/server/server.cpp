@@ -16,6 +16,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <unordered_set>
 #include <thread>
 
 #pragma GCC diagnostic push
@@ -1222,13 +1223,20 @@ bool base64_decode(const std::string& in, std::string& out) {
 // Text of a message's content. Parts are joined without a separator, as llama-server does. An `image_url` part
 // with a data: URI is decoded into `images` and leaves a marker in the text; without `images` (or on a bad part)
 // `err` says why.
-std::string content_parts_to_text(const ojson& content, std::vector<std::string>* images = nullptr, std::string* err = nullptr) {
+std::string content_parts_to_text(const ojson& content, std::vector<std::string>* images = nullptr, std::string* err = nullptr,
+                                  std::vector<size_t>* cache_marks = nullptr) {
     if (content.is_string()) {
         return content.get<std::string>();
     }
     if (content.is_array()) {
         std::string out;
+        // a part with "cache_control" asks for the state at its end to be kept: remember where it ends
+        struct MarkAtEnd {
+            const ojson& part; std::string& out; std::vector<size_t>* marks;
+            ~MarkAtEnd() { if (marks != nullptr && part.is_object() && part.contains("cache_control") && part["cache_control"].is_object()) marks->push_back(out.size()); }
+        };
         for (const auto& part : content) {
+            const MarkAtEnd mark{part, out, cache_marks};
             if (part.is_string()) {
                 out += part.get<std::string>();
             } else if (part.is_object() && part.value("type", "") == "image_url") {
@@ -1488,10 +1496,13 @@ Status parse_chat_request(const ojson& j, const std::string& default_model, uint
                 cm.role = (m.contains("role") && m["role"].is_string()) ? m["role"].get<std::string>() : "user";
                 if (m.contains("content")) {
                     std::string content_err;
-                    cm.content = content_parts_to_text(m["content"], &req.images, &content_err);
+                    cm.content = content_parts_to_text(m["content"], &req.images, &content_err, &cm.cache_marks);
                     if (!content_err.empty()) {
                         return Status::Error(ErrorCode::InvalidArgument, content_err);
                     }
+                }
+                if (m.contains("cache_control") && m["cache_control"].is_object()) {
+                    cm.cache_marks.push_back(cm.content.size());   // on the message itself: its whole content
                 }
                 if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
                     cm.reasoning_content = m["reasoning_content"].get<std::string>();
@@ -1540,6 +1551,7 @@ Status parse_chat_request(const ojson& j, const std::string& default_model, uint
         v.reset();
         get_u32("reasoning_budget_tokens", v);
         if (!v) get_u32("reasoning_budget", v);
+        if (!v) get_u32("thinking_budget", v);   // the name other Qwen servers use
         if (v) req.budgets.reasoning_budget_tokens = *v;
         v.reset();
         get_u32("answer_budget_tokens", v);
@@ -1552,6 +1564,16 @@ Status parse_chat_request(const ojson& j, const std::string& default_model, uint
         if (j.contains("presence_penalty") && j["presence_penalty"].is_number()) req.sampling.presence_penalty = j["presence_penalty"].get<float>();
         if (j.contains("seed") && j["seed"].is_number_integer()) req.sampling.seed = static_cast<uint64_t>(j["seed"].get<int64_t>());
         if (j.contains("stream") && j["stream"].is_boolean()) req.stream = j["stream"].get<bool>();
+        if (j.contains("stream_options") && j["stream_options"].is_object() && j["stream_options"].contains("include_usage") &&
+            j["stream_options"]["include_usage"].is_boolean()) {
+            req.stream_include_usage = j["stream_options"]["include_usage"].get<bool>();
+        }
+        if (j.contains("draft")) {
+            if (!j["draft"].is_boolean()) {
+                return Status::Error(ErrorCode::InvalidArgument, "'draft' must be true or false");
+            }
+            req.draft = j["draft"].get<bool>();
+        }
         if (j.contains("n") && j["n"].is_number_integer()) {
             const int64_t n = j["n"].get<int64_t>();
             if (n < 1 || n > 16) {
@@ -1655,6 +1677,11 @@ struct SixiServer::Impl {
     // Long prompt prefills run one after another (first come, first served) but outside backend_mutex, so that a
     // request whose prompt is already cached is not queued behind another agent's cold document load.
     std::mutex long_prefill_mutex;
+    // Prompts that some request is loading right now (hashes of their tokens). A second request for the same
+    // prompt waits for the first and starts from the state it keeps, instead of loading the same rows next to it.
+    std::mutex loading_mu;
+    std::condition_variable loading_cv;
+    std::unordered_multiset<uint64_t> loading_prompts;
     std::atomic<uint32_t> interactive_waiting{0};   // interactive requests waiting for backend_mutex
     mutable std::mutex metrics_mutex;
 
@@ -1679,6 +1706,7 @@ struct SixiServer::Impl {
     std::atomic<uint64_t> completed_requests{0};
     std::atomic<uint64_t> cancelled_requests{0};
     std::atomic<uint64_t> admission_rejected_requests{0};
+    std::atomic<uint64_t> prefill_requeue_hits{0};   // long prompt loads answered from the state of the request in front of them in the queue
     std::atomic<uint64_t> numeric_error_requests{0};
     std::atomic<uint64_t> tool_validation_errors{0};
     std::atomic<uint64_t> fallback_events{0};
@@ -2027,6 +2055,7 @@ SixiServer::SixiServer(
         j["completed_requests"] = m.completed_requests;
         j["cancelled_requests"] = m.cancelled_requests;
         j["admission_rejected_requests"] = m.admission_rejected_requests;
+        j["prefix_cache_hits_after_queue"] = m.prefix_cache_hits_after_queue;
         j["numeric_error_requests"] = m.numeric_error_requests;
         j["tool_validation_errors"] = m.tool_validation_errors;
         j["fallback_events"] = m.fallback_events;
@@ -2085,6 +2114,61 @@ SixiServer::SixiServer(
         http_res.status = 200;
         http_res.set_content(client_json(out), "application/json");
     });
+
+    // POST /tokenize (also /v1/tokenize): the token ids of "content", or of the prompt that "messages" render to
+    // (with the request's "tools", "enable_thinking" and "reasoning_effort", as /v1/chat/completions would read it;
+    // images are not counted). A client can see how long a prompt is before it sends it: the state at the end of
+    // a system message is kept from 512 tokens.
+    auto tokenize_handler = [this](const httplib::Request& http_req, httplib::Response& http_res) {
+        if (!impl_->authorized(http_req)) {
+            Impl::send_error(http_res, 401, ErrorCode::InvalidArgument, "Unauthorized");
+            return;
+        }
+        ojson j = ojson::parse(http_req.body, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) {
+            Impl::send_error(http_res, 400, ErrorCode::InvalidArgument, "Invalid JSON body");
+            return;
+        }
+        std::string text;
+        bool special = false;
+        if (j.contains("content") && j["content"].is_string()) {
+            text = j["content"].get<std::string>();
+            special = j.value("parse_special", false);
+        } else if (j.contains("messages")) {
+            ChatCompletionRequest chat_req;
+            Status pst = parse_chat_request(j, impl_->default_model_id(), 0, chat_req);
+            if (!pst.ok()) {
+                Impl::send_error(http_res, 400, pst.code, pst.message);
+                return;
+            }
+            ChatTemplateOptions topts;
+            topts.enable_thinking = chat_req.enable_thinking;
+            topts.reasoning_effort = chat_req.reasoning_effort;
+            topts.preserve_thinking = chat_req.preserve_thinking;
+            auto rp = render_chat_prompt(impl_->template_kind, chat_req.messages, chat_req.tools_json, topts);
+            if (!rp.ok()) {
+                Impl::send_error(http_res, 400, rp.code(), rp.message());
+                return;
+            }
+            text = rp->text;
+            special = true;
+        } else {
+            Impl::send_error(http_res, 400, ErrorCode::InvalidArgument, "Send \"content\" (a string) or \"messages\"");
+            return;
+        }
+        auto tok = impl_->backend->tokenize(text, special);
+        if (!tok.ok()) {
+            Impl::send_error(http_res, 400, tok.code(), tok.message());
+            return;
+        }
+        json out;
+        out["tokens"] = tok.value();
+        out["count"] = tok->size();
+        http_res.status = 200;
+        http_res.set_content(client_json(out), "application/json");
+    };
+    impl_->http_svr.Post("/tokenize", tokenize_handler);
+    impl_->http_svr.Post("/v1/tokenize", tokenize_handler);
 
     // POST /v1/chat/completions
     impl_->http_svr.Post("/v1/chat/completions", [this](const httplib::Request& http_req, httplib::Response& http_res) {
@@ -2356,7 +2440,10 @@ SixiServer::SixiServer(
                 {"completion_tokens", completion_tokens},
                 {"reasoning_tokens", reasoning_tokens},
                 {"answer_tokens", answer_tokens},
-                {"total_tokens", cr.prompt_tokens + completion_tokens}
+                {"total_tokens", cr.prompt_tokens + completion_tokens},
+                // the same two counts under the names of the OpenAI API
+                {"prompt_tokens_details", {{"cached_tokens", cr.prompt_cached_tokens}}},
+                {"completion_tokens_details", {{"reasoning_tokens", reasoning_tokens}}}
             }},
             {"metrics", {
                 {"ttft_ms", cr.ttft_ms},
@@ -2452,6 +2539,63 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
     std::function<bool(const std::string& sse_chunk)> stream_sink) {
 
     impl_->total_requests.fetch_add(1, std::memory_order_relaxed);
+
+    // A stream that has sent nothing for a while gets an SSE comment line. While a long prompt loads, or the
+    // request waits behind other loads, the server has nothing to say, and a proxy between the client and the
+    // server may close a connection that stays silent. Clients skip lines that begin with a colon.
+    struct StreamKeepAlive {
+        std::function<bool(const std::string&)> raw;
+        std::mutex mu;
+        std::atomic<int64_t> last_ms{0};
+        std::atomic<bool> dead{false};
+        bool stop = false;                 // under stop_mu
+        std::mutex stop_mu;
+        std::condition_variable stop_cv;   // ends the wait at once when the request is over
+        std::thread beat;
+        static int64_t now_ms() {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+        bool write(const std::string& chunk) {
+            std::lock_guard<std::mutex> lk(mu);
+            last_ms.store(now_ms(), std::memory_order_release);
+            if (dead.load(std::memory_order_acquire) || !raw(chunk)) {
+                dead.store(true, std::memory_order_release);
+                return false;
+            }
+            return true;
+        }
+        void start(int64_t every_ms) {
+            last_ms.store(now_ms(), std::memory_order_release);
+            beat = std::thread([this, every_ms] {
+                while (true) {
+                    {
+                        std::unique_lock<std::mutex> lk(stop_mu);
+                        if (stop_cv.wait_for(lk, std::chrono::milliseconds(200), [this] { return stop; })) {
+                            return;
+                        }
+                    }
+                    if (!dead.load(std::memory_order_acquire) && now_ms() - last_ms.load(std::memory_order_acquire) >= every_ms) {
+                        (void)write(": keep-alive\n\n");
+                    }
+                }
+            });
+        }
+        ~StreamKeepAlive() {
+            {
+                std::lock_guard<std::mutex> lk(stop_mu);
+                stop = true;
+            }
+            stop_cv.notify_all();
+            if (beat.joinable()) beat.join();
+        }
+    } keep_alive;
+    if (stream_sink) {
+        keep_alive.raw = std::move(stream_sink);
+        stream_sink = [&keep_alive](const std::string& chunk) { return keep_alive.write(chunk); };
+        if (impl_->cfg.sse_keepalive_ms > 0) {
+            keep_alive.start(static_cast<int64_t>(impl_->cfg.sse_keepalive_ms));
+        }
+    }
 
     if (!impl_->cfg.admission.admitted) {
         impl_->admission_rejected_requests.fetch_add(1, std::memory_order_relaxed);
@@ -2749,6 +2893,22 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
         lk.lock();
         impl_->interactive_waiting.fetch_sub(1, std::memory_order_acq_rel);
     };
+    // A request that may load a prompt says so before it waits for anything: the first of several that arrive
+    // together then waits for the others and their prompts load in shared passes (IBackend::forward_tokens_merged).
+    // Not for background work (it loads in small chunks on purpose) and not with images (decoded on their own).
+    struct LoadAnnouncement {
+        core::IBackend* b;
+        bool open;
+        bool take() noexcept { const bool was = open; open = false; return was; }
+        void close() noexcept { if (open) { open = false; b->retract_prompt_load(); } }
+        ~LoadAnnouncement() { close(); }
+    } load_announcement{impl_->backend.get(), false};
+    const bool merge_loads = impl_->cfg.merge_prompt_loads && n_streams > 1 && !req.background && req.images.empty();
+    if (merge_loads) {
+        impl_->backend->announce_prompt_load();
+        load_announcement.open = true;
+    }
+
     std::unique_lock<std::mutex> backend_lock(impl_->backend_mutex, std::defer_lock);
     lock_requests(backend_lock);
     // One exclusive device section for the whole setup (released before the decode loop or on any early return)
@@ -2832,6 +2992,50 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
         }
     };
 
+    // "cache_control" on a content part: the client says where a state is worth keeping (the end of a document or
+    // of a tool list inside a message, the last message it may come back to). The position is found by rendering
+    // the conversation cut at that place and taking what it shares with the prompt, text first and tokens second,
+    // so it is a prefix of the prompt whatever the template puts around a message. Up to four marks, the last
+    // ones; a text-only prompt (an image's rows are decoded whole).
+    std::vector<size_t> mark_positions;
+    if (impl_->cfg.enable_prefix_cache && impl_->backend->device_snapshot_slots() > 1 && req.raw_prompt.empty() && req.images.empty()) {
+        std::vector<std::pair<size_t, size_t>> marks;   // message index, byte offset in its content
+        for (size_t mi = 0; mi < req.messages.size(); ++mi) {
+            for (const size_t off : req.messages[mi].cache_marks) marks.emplace_back(mi, off);
+        }
+        if (marks.size() > 4) marks.erase(marks.begin(), marks.end() - 4);
+        for (const auto& [mi, off] : marks) {
+            std::vector<ChatMessage> cut(req.messages.begin(), req.messages.begin() + static_cast<std::ptrdiff_t>(mi) + 1);
+            cut.back().content.resize(std::min(off, cut.back().content.size()));
+            ChatTemplateOptions copts;
+            copts.enable_thinking = req.enable_thinking;
+            copts.reasoning_effort = req.reasoning_effort;
+            copts.preserve_thinking = req.preserve_thinking;
+            copts.add_generation_prompt = false;
+            std::vector<std::string> tools_json = req.tools_json;
+            if (tools_json.empty() && !req.tools.empty()) {
+                for (const auto& td : req.tools) tools_json.push_back(tool_definition_to_json(td));
+            }
+            auto cut_rp = render_chat_prompt(impl_->template_kind, cut, tools_json, copts);
+            if (!cut_rp.ok()) continue;
+            size_t same = 0;
+            const size_t lim = std::min(cut_rp->text.size(), rp.text.size());
+            while (same < lim && cut_rp->text[same] == rp.text[same]) ++same;
+            same = utf8_whole_prefix(rp.text.substr(0, same));
+            auto cut_tok = impl_->backend->tokenize(rp.text.substr(0, same), true);
+            if (!cut_tok.ok()) continue;
+            size_t at = 0;
+            const size_t tlim = std::min(cut_tok->size(), prompt_tokens.size());
+            while (at < tlim && cut_tok.value()[at] == prompt_tokens[at]) ++at;
+            if (at >= 256) mark_positions.push_back(at);
+        }
+        std::sort(mark_positions.begin(), mark_positions.end());
+        mark_positions.erase(std::unique(mark_positions.begin(), mark_positions.end()), mark_positions.end());
+    }
+    // a mark at the end of the prompt (within the template's last tokens): the state after the load is kept as an
+    // anchor, not as a tail that the next prompts push out
+    const bool end_marked = !mark_positions.empty() && mark_positions.back() + 8 > prompt_tokens.size();
+
     // Where the system part of the prompt ends (the first user block), when it is long enough to be worth a slot.
     size_t anchor_pos = 0;
     if (impl_->cfg.enable_prefix_cache && impl_->backend->device_snapshot_slots() > 1) {
@@ -2842,6 +3046,68 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             if (it != prompt_tokens.end() && at >= 512) anchor_pos = at;
         }
     }
+
+    // The longest device slot whose tokens are a prefix of the prompt and longer than `longer_than`, restored into
+    // the stream. `from` is where the prompt load goes on; `complete`: the slot held the whole prompt with what its
+    // last position gave, nothing is left to evaluate (current_logits is set).
+    // `touched` without `ok`: a slot was tried and the stream no longer holds what it held (the caller starts over).
+    struct SlotStart { bool ok = false; bool complete = false; bool touched = false; size_t from = 0; };
+    auto restore_from_slot = [&](size_t longer_than) -> SlotStart {
+        SlotStart out;
+        const size_t n = prompt_tokens.size();
+        const uint32_t n_dev_slots = impl_->backend->device_snapshot_slots();
+        const uint32_t window = impl_->backend->fast_rollback_window();
+        int best = -1;
+        size_t best_len = longer_than;
+        for (uint32_t sidx = 0; sidx < n_dev_slots; ++sidx) {
+            const std::vector<int32_t> st = impl_->backend->device_snapshot_tokens(sidx);
+            if (st.empty() || st.size() > n || st.size() <= best_len) continue;
+            if (st.size() == n && window == 0) continue;
+            if (std::equal(st.begin(), st.end(), prompt_tokens.begin())) {
+                best = static_cast<int>(sidx);
+                best_len = st.size();
+            }
+        }
+        if (best < 0) {
+            return out;
+        }
+        out.touched = true;
+        if (!impl_->backend->device_snapshot_restore(static_cast<uint32_t>(best)).ok()) {
+            return out;
+        }
+        if (impl_->device_slot_last_use.size() < n_dev_slots) impl_->device_slot_last_use.resize(n_dev_slots, 0);
+        if (impl_->device_slot_logits.size() < n_dev_slots) impl_->device_slot_logits.resize(n_dev_slots);
+        auto& sl = impl_->device_slot_logits[static_cast<size_t>(best)];
+        // What the slot kept after its prefill: the full logits row, or (prefill under the device's
+        // argmax) only the chosen token with a stand-in row that is 1 at that token and 0 elsewhere.
+        // A request that samples or is constrained reads the row: drawn from the stand-in, its first
+        // token was one of the lowest token ids ('*', '+', '%', a digit) nine times out of ten.
+        const bool slot_row = !sl.logits.empty() && sl.greedy_token < 0;
+        const bool need_row = !greedy || answer_constraint;
+        if (best_len == n && (slot_row || (!need_row && sl.greedy_token >= 0))) {
+            // Identical prompt: the post-prefill logits were kept with the slot, nothing to evaluate
+            current_logits = sl.logits;
+            impl_->backend->set_last_sampled_greedy_token(
+                slot_row ? core::DeterministicSampler::sample_greedy_argmax(sl.logits.data(), impl_->backend->vocab_size())
+                         : sl.greedy_token);
+            out.ok = true;
+            out.complete = true;
+            out.from = n;
+        } else if (best_len < n) {
+            out.ok = true;
+            out.from = best_len;
+        } else if (impl_->backend->rollback_to_position(n - 1).ok()) {
+            out.ok = true;
+            out.from = n - 1;
+        }
+        if (out.ok) {
+            impl_->device_slot_last_use[static_cast<size_t>(best)] = ++impl_->device_slot_clock;
+        }
+        return out;
+    };
+    // Prompt tokens a request did not load because a request in front of it in the queue of long loads had loaded
+    // them meanwhile (requests for one long prompt that arrive together).
+    std::optional<size_t> reused_after_queue;
 
     // Long prefills leave two tail checkpoints (512 and 64 tokens before the end of the prompt): the next request
     // about the same document differs only in its last tokens (the question and the template tail), and neither
@@ -2854,32 +3120,101 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             if (n_total > 512 && n_total - 512 >= from + 256) cuts.push_back(n_total - 512);
             cuts.push_back(n_total - 64);
         }
-        // the end of a long system prompt, when this prefill passes it
-        const bool with_anchor = anchor_pos >= from + 256 && anchor_pos + 8 <= n_total;
-        if (with_anchor) cuts.push_back(anchor_pos);
+        // the end of a long system prompt and the places the client marked, when this prefill passes them (a
+        // place less than 256 tokens after the one before it is not worth a state of its own)
+        std::vector<size_t> anchor_cuts;
+        {
+            std::vector<size_t> want = mark_positions;
+            if (anchor_pos > 0) want.push_back(anchor_pos);
+            std::sort(want.begin(), want.end());
+            size_t prev = from;
+            for (const size_t at : want) {
+                if (at >= prev + 256 && at + 8 <= n_total) {
+                    anchor_cuts.push_back(at);
+                    prev = at;
+                }
+            }
+        }
+        cuts.insert(cuts.end(), anchor_cuts.begin(), anchor_cuts.end());
         cuts.push_back(n_total);
         std::sort(cuts.begin(), cuts.end());
         cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
         size_t pos = from;
         for (const size_t cut : cuts) {
-            std::vector<int32_t> delta(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(pos),
-                                       prompt_tokens.begin() + static_cast<std::ptrdiff_t>(cut));
+            if (cut <= pos) continue;   // a state restored after the queue (below) covers this part already
             // A long prefill of one stream must not block the setup of other requests: 16 agents with 17k-token
             // documents loaded one after another for 8 minutes, and the follow-up questions of the agents that were
             // already loaded waited behind the remaining loads (median 223 s; 0.4 s once all were loaded). The
             // stream is leased, so its prefill needs neither the lock nor the setup section; the backend hands the
             // device to waiting requests between chunks.
             // (a background request releases the lock for every part of its prompt, short tails included)
-            const bool release = n_streams > 1 && (delta.size() >= 1024 || req.background) && backend_lock.owns_lock();
+            bool release = n_streams > 1 && (cut - pos >= 1024 || req.background) && backend_lock.owns_lock();
             std::unique_lock<std::mutex> long_lock;
             if (release) {
+                load_announcement.close();   // a long load has its own queue and shares no pass
                 setup_section.end();
                 backend_lock.unlock();
-                long_lock = std::unique_lock<std::mutex>(impl_->long_prefill_mutex);
+                long_lock = std::unique_lock<std::mutex>(impl_->long_prefill_mutex, std::try_to_lock);
+                if (!long_lock.owns_lock()) {
+                    long_lock.lock();
+                    // This request waited behind another long load. Several requests for one long prompt that
+                    // arrive together (the samples of a client that asks n times, agents that start from one
+                    // document) all searched the kept states before the first of them had loaded anything, and
+                    // each then loaded the whole prompt. Search again: the request in front has left its
+                    // checkpoints, and its full state if it got the lock first.
+                    if (impl_->cfg.enable_prefix_cache && impl_->backend->device_snapshot_slots() > 0) {
+                        lock_requests(backend_lock);
+                        setup_section.on = true;
+                        impl_->backend->begin_setup();
+                        const SlotStart again = restore_from_slot(pos);
+                        if (again.ok) {
+                            pos = again.from;
+                            reused_after_queue = again.from;
+                            impl_->prefill_requeue_hits.fetch_add(1, std::memory_order_relaxed);
+                        } else if (again.touched) {
+                            // a slot was tried and could not be used: the stream is not at `pos` any more
+                            Status rst = impl_->backend->reset_state();
+                            if (!rst.ok()) {
+                                return rst;
+                            }
+                            pos = 0;
+                            reused_after_queue = 0;
+                        }
+                        if (again.ok && again.complete) {
+                            return check_numeric(current_logits);
+                        }
+                        if (cut <= pos) {
+                            continue;
+                        }
+                        if (cut - pos >= 1024 || req.background) {
+                            setup_section.end();
+                            backend_lock.unlock();
+                        } else {
+                            // a short rest: loaded under the lock like any short prompt
+                            long_lock.unlock();
+                            release = false;
+                        }
+                    }
+                }
+            }
+            std::vector<int32_t> delta(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(pos),
+                                       prompt_tokens.begin() + static_cast<std::ptrdiff_t>(cut));
+            // A load that is not long shares its passes with the loads of the requests that arrived with it: the
+            // lock and the device go back for the time of the load, as for a long one.
+            const bool merged = !release && merge_loads && backend_lock.owns_lock();
+            if (merged) {
+                setup_section.end();
+                backend_lock.unlock();
             }
             // 0: the backend's largest chunk (n_batch), the fastest way to load a prompt. A background request
             // loads in chunks of 256 rows (about 0.3 s each on the Thor) and yields the device between them.
-            auto fw = impl_->backend->forward_tokens(delta, req.background ? 256u : 0u);
+            auto fw = merged ? impl_->backend->forward_tokens_merged(delta, load_announcement.take())
+                             : impl_->backend->forward_tokens(delta, req.background ? 256u : 0u);
+            if (merged) {
+                lock_requests(backend_lock);
+                setup_section.on = true;
+                impl_->backend->begin_setup();
+            }
             if (release) {
                 long_lock.unlock();
                 lock_requests(backend_lock);
@@ -2896,11 +3231,54 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             if (cut == n_total) {
                 current_logits = std::move(fw.value());
             } else {
-                save_checkpoint_slot(with_anchor && cut == anchor_pos);
+                save_checkpoint_slot(std::find(anchor_cuts.begin(), anchor_cuts.end(), cut) != anchor_cuts.end());
             }
         }
         return check_numeric(current_logits);
     };
+
+    // The same prompt from several requests at once (the samples of one question sent as separate requests):
+    // the first loads it, the others wait here and then find its state among the slots. Without this they would
+    // all load it side by side in shared passes, every row as many times as there are requests.
+    struct LoadingPrompt {
+        Impl* impl;
+        uint64_t key;
+        bool mine = false;
+        void done() noexcept {
+            if (!mine) return;
+            mine = false;
+            {
+                std::lock_guard<std::mutex> lk(impl->loading_mu);
+                auto it = impl->loading_prompts.find(key);
+                if (it != impl->loading_prompts.end()) impl->loading_prompts.erase(it);
+            }
+            impl->loading_cv.notify_all();
+        }
+        ~LoadingPrompt() { done(); }
+    } loading_prompt{impl_.get(), 0};
+    if (impl_->cfg.enable_prefix_cache && n_streams > 1 && impl_->backend->device_snapshot_slots() > 0 && prompt_tokens.size() >= 64) {
+        uint64_t h = 1469598103934665603ull;   // FNV-1a over the token ids
+        for (const int32_t t : prompt_tokens) {
+            h = (h ^ static_cast<uint64_t>(static_cast<uint32_t>(t))) * 1099511628211ull;
+        }
+        loading_prompt.key = h;
+        std::unique_lock<std::mutex> lk(impl_->loading_mu);
+        if (impl_->loading_prompts.count(h) > 0) {
+            // somebody is loading this prompt: give the lock and the device back and wait for it
+            load_announcement.close();
+            setup_section.end();
+            backend_lock.unlock();
+            impl_->loading_cv.wait_for(lk, std::chrono::seconds(600), [&] { return impl_->loading_prompts.count(h) == 0; });
+            lk.unlock();
+            lock_requests(backend_lock);
+            setup_section.on = true;
+            impl_->backend->begin_setup();
+            impl_->prefill_requeue_hits.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            impl_->loading_prompts.insert(h);
+            loading_prompt.mine = true;
+        }
+    }
 
     // Prefix reuse: (a) continue/rollback the live backend state, (b) restore the last prefill snapshot,
     // (c) full reset + prefill. At least one prompt token is always re-evaluated to obtain fresh logits.
@@ -2938,54 +3316,16 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             const uint32_t n_dev_slots = impl_->backend->device_snapshot_slots();
             if (!done && n_dev_slots > 0) {
                 // Device-side snapshot slots: longest slot whose tokens are a prefix of the prompt
-                const uint32_t window = impl_->backend->fast_rollback_window();
-                int best = -1;
-                size_t best_len = 0;
-                for (uint32_t sidx = 0; sidx < n_dev_slots; ++sidx) {
-                    const std::vector<int32_t> st = impl_->backend->device_snapshot_tokens(sidx);
-                    if (st.empty() || st.size() > n || st.size() <= best_len) continue;
-                    if (st.size() == n && window == 0) continue;
-                    if (std::equal(st.begin(), st.end(), prompt_tokens.begin())) {
-                        best = static_cast<int>(sidx);
-                        best_len = st.size();
-                    }
-                }
-                if (best >= 0 && impl_->backend->device_snapshot_restore(static_cast<uint32_t>(best)).ok()) {
-                    if (impl_->device_slot_last_use.size() < n_dev_slots) impl_->device_slot_last_use.resize(n_dev_slots, 0);
-                    if (impl_->device_slot_logits.size() < n_dev_slots) impl_->device_slot_logits.resize(n_dev_slots);
-                    auto& sl = impl_->device_slot_logits[static_cast<size_t>(best)];
-                    // What the slot kept after its prefill: the full logits row, or (prefill under the device's
-                    // argmax) only the chosen token with a stand-in row that is 1 at that token and 0 elsewhere.
-                    // A request that samples or is constrained reads the row: drawn from the stand-in, its first
-                    // token was one of the lowest token ids ('*', '+', '%', a digit) nine times out of ten.
-                    const bool slot_row = !sl.logits.empty() && sl.greedy_token < 0;
-                    const bool need_row = !greedy || answer_constraint;
-                    if (best_len == n && (slot_row || (!need_row && sl.greedy_token >= 0))) {
-                        // Identical prompt: the post-prefill logits were kept with the slot, nothing to evaluate
-                        current_logits = sl.logits;
-                        impl_->backend->set_last_sampled_greedy_token(
-                            slot_row ? core::DeterministicSampler::sample_greedy_argmax(sl.logits.data(), impl_->backend->vocab_size())
-                                     : sl.greedy_token);
-                        reused = n;
-                        done = true;
-                    } else if (best_len < n) {
-                        Status st = prefill_from(best_len);
+                const SlotStart start = restore_from_slot(0);
+                if (start.ok) {
+                    if (!start.complete) {
+                        Status st = prefill_from(start.from);
                         if (!st.ok()) {
                             return st;
                         }
-                        reused = best_len;
-                        done = true;
-                    } else if (impl_->backend->rollback_to_position(n - 1).ok()) {
-                        Status st = prefill_from(n - 1);
-                        if (!st.ok()) {
-                            return st;
-                        }
-                        reused = n - 1;
-                        done = true;
                     }
-                    if (done) {
-                        impl_->device_slot_last_use[static_cast<size_t>(best)] = ++impl_->device_slot_clock;
-                    }
+                    reused = start.from;
+                    done = true;
                 }
             }
             if (!done && n_dev_slots == 0 && !impl_->prefix_snapshots.empty()) {
@@ -3059,6 +3399,8 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
                 return st;
             }
         }
+        if (reused_after_queue.has_value()) reused = *reused_after_queue;
+        load_announcement.close();   // nothing (more) to load
         resp.prompt_cached_tokens = static_cast<uint32_t>(reused);
         if (reused > 0) {
             std::lock_guard<std::mutex> mlock(impl_->metrics_mutex);
@@ -3094,10 +3436,11 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             }
         }
         if (target != -2) {
-            target = pick_slot(false);
+            target = pick_slot(end_marked);
+            if (target < 0 && end_marked) target = pick_slot(false);
             if (target >= 0 && impl_->backend->device_snapshot_save(static_cast<uint32_t>(target)).ok()) {
                 impl_->device_slot_last_use[static_cast<size_t>(target)] = ++impl_->device_slot_clock;
-                impl_->device_slot_anchor[static_cast<size_t>(target)] = 0;
+                impl_->device_slot_anchor[static_cast<size_t>(target)] = end_marked ? 1 : 0;
                 if (impl_->device_slot_logits.size() < n_dev_slots_save) impl_->device_slot_logits.resize(n_dev_slots_save);
                 auto& sl = impl_->device_slot_logits[static_cast<size_t>(target)];
                 sl.logits = current_logits;
@@ -3121,6 +3464,7 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             }
         }
     }
+    loading_prompt.done();   // the state of this prompt is kept: requests that waited for it go on
     const auto t_after_prefill = std::chrono::steady_clock::now();
     resp.snapshot_ms = std::chrono::duration<double, std::milli>(t_after_prefill - t_snapshot_start).count();
     const double prefill_ms = std::chrono::duration<double, std::milli>(t_after_prefill - t_start).count();
@@ -3232,7 +3576,7 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             spec_cfg.adaptive_k = false;
         }
     }
-    if (impl_->cfg.disable_speculation ||
+    if (impl_->cfg.disable_speculation || !req.draft ||
         (!spec_cfg.enable_suffix_drafter && spec_cfg.neural_drafter == NeuralDrafterType::None)) {
         spec_cfg.draft_k = 0;
         spec_cfg.enable_suffix_drafter = false;
@@ -3585,6 +3929,15 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
             // bytes of a character whose rest never came are sent as they are (U+FFFD in the JSON)
             (void)emit_delta("reasoning_content", std::string(), true);
             (void)emit_delta("content", std::string(), true);
+            const json usage = {
+                {"prompt_tokens", resp.prompt_tokens},
+                {"prompt_cached_tokens", resp.prompt_cached_tokens},
+                {"completion_tokens", resp.completion_tokens},
+                {"reasoning_tokens", resp.reasoning_tokens},
+                {"total_tokens", resp.prompt_tokens + resp.completion_tokens},
+                {"prompt_tokens_details", {{"cached_tokens", resp.prompt_cached_tokens}}},
+                {"completion_tokens_details", {{"reasoning_tokens", resp.reasoning_tokens}}}
+            };
             json final_chunk = {
                 {"id", resp.id},
                 {"object", "chat.completion.chunk"},
@@ -3597,13 +3950,7 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
                         {"finish_reason", resp.finish_reason}
                     }
                 })},
-                {"usage", {
-                    {"prompt_tokens", resp.prompt_tokens},
-                    {"prompt_cached_tokens", resp.prompt_cached_tokens},
-                    {"completion_tokens", resp.completion_tokens},
-                    {"reasoning_tokens", resp.reasoning_tokens},
-                    {"total_tokens", resp.prompt_tokens + resp.completion_tokens}
-                }},
+                {"usage", usage},
                 {"metrics", {
                     {"ttft_ms", resp.ttft_ms},
                     {"tpot_ms", resp.tpot_ms},
@@ -3624,7 +3971,14 @@ Result<ChatCompletionResponse> SixiServer::handle_chat_completion(
                 }
                 final_chunk["choices"][0]["delta"]["tool_calls"] = tcs;
             }
+            // "stream_options": {"include_usage": true}: the usage once more in a chunk without choices, where
+            // clients of the OpenAI API look for it (the chunk above carries it for every client, asked or not)
+            const json usage_chunk = {
+                {"id", resp.id}, {"object", "chat.completion.chunk"}, {"created", created_ts}, {"model", resp.model},
+                {"choices", json::array()}, {"usage", usage}
+            };
             if (!stream_sink("data: " + client_json(final_chunk) + "\n\n") ||
+                (req.stream_include_usage && !stream_sink("data: " + client_json(usage_chunk) + "\n\n")) ||
                 !stream_sink("data: [DONE]\n\n")) {
                 impl_->cancelled_requests.fetch_add(1, std::memory_order_relaxed);
                 resp.finish_reason = "cancelled";
@@ -3678,6 +4032,7 @@ RuntimeMetrics SixiServer::metrics_snapshot() const {
     m.completed_requests = impl_->completed_requests.load(std::memory_order_relaxed);
     m.cancelled_requests = impl_->cancelled_requests.load(std::memory_order_relaxed);
     m.admission_rejected_requests = impl_->admission_rejected_requests.load(std::memory_order_relaxed);
+    m.prefix_cache_hits_after_queue = impl_->prefill_requeue_hits.load(std::memory_order_relaxed);
     m.numeric_error_requests = impl_->numeric_error_requests.load(std::memory_order_relaxed);
     m.tool_validation_errors = impl_->tool_validation_errors.load(std::memory_order_relaxed);
     m.fallback_events = impl_->fallback_events.load(std::memory_order_relaxed);

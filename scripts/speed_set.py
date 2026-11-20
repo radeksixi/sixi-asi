@@ -4,7 +4,7 @@
 The five-prompt `ab_bench.py` is decided by which text the model happens to write: two builds whose answers differ
 in a few tokens can differ by ten percent on it, because the drafter agrees with the model for a different share of
 that text. This script uses 60 prompts (30 GSM8K problems, 20 HumanEval tasks, 10 everyday questions; the same
-sample every time) and reports, next to tokens per second, the two things tok/s is made of:
+sample every time; `--temperature`, `--top-p`, `--top-k` and `--request-seed` measure sampled answers) and reports, next to tokens per second, the two things tok/s is made of:
 
   ms per speculative step   what the engine and the kernels cost
   tokens accepted per step  what the drafter and the text give
@@ -50,8 +50,9 @@ def prompts(n_gsm, n_he, seed):
     return out
 
 
-def ask(url, text, max_tokens, thinking):
+def ask(url, text, max_tokens, thinking, sampling=None):
     body = {"messages": [{"role": "user", "content": text}], "max_tokens": max_tokens, "temperature": 0, "enable_thinking": thinking}
+    body.update(sampling or {})
     req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
     r = json.loads(urllib.request.urlopen(req, timeout=900).read())
     m = r.get("metrics") or {}
@@ -70,8 +71,16 @@ def main():
     ap.add_argument("--n-he", type=int, default=20)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--thinking", action="store_true", help="keep the reasoning phase")
+    ap.add_argument("--temperature", type=float, default=0.0, help="above 0: sampled answers (send --request-seed to repeat them)")
+    ap.add_argument("--top-p", type=float, default=None)
+    ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--request-seed", type=int, default=None, help="the seed field of every request")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
+    sampling = {"temperature": a.temperature}
+    for field, value in (("top_p", a.top_p), ("top_k", a.top_k), ("seed", a.request_seed)):
+        if value is not None:
+            sampling[field] = value
 
     ps = prompts(a.n_gsm, a.n_he, a.seed)
     runs = []
@@ -79,7 +88,7 @@ def main():
         rows = []
         t0 = time.time()
         for kind, text in ps:
-            r = ask(a.url, text, a.max_tokens, a.thinking)
+            r = ask(a.url, text, a.max_tokens, a.thinking, sampling)
             r["kind"] = kind
             rows.append(r)
         use = [r for r in rows if r["tokens"] >= 8 and r["tok_s"] > 0]

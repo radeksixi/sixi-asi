@@ -57,6 +57,10 @@ void usage() {
         "  --spec-k N              draft tokens per step (default: min(backend rollback window, 7))\n"
         "  --reserve-interactive N slots that requests with \"priority\": \"background\" never take (default 0); such requests\n"
         "                          wait for a slot instead of failing, and load their prompts in small chunks\n"
+        "  --merge-loads           with --parallel 2 or more: the prompts of requests that arrive at the same moment\n"
+        "                          load in shared passes (a fifth less time for such a burst; off by default)\n"
+        "  --sse-keepalive N       a stream that is silent for N seconds (a long prompt loading) gets an SSE comment\n"
+        "                          line, so that a proxy does not close it (default 15; 0 = never)\n"
         "  --mmproj PATH           projector file (mmproj GGUF): accept images as `image_url` parts with data: URIs\n"
         "  --image-max-tokens N    most rows one image may take (default: the projector's own; fewer rows load faster,\n"
         "                          more read small text better); --image-min-tokens N the least\n"
@@ -65,7 +69,8 @@ void usage() {
         "  --kv-type T             KV cache type f16|bf16|q8_0|q4_0 (default: library f16; quantized V enables flash-attn)\n"
         "  --no-neural-drafter     suffix drafter only (no MTP / DFlash2)\n"
         "  --no-spec               plain autoregressive decoding (baseline for A/B)\n"
-        "  --n-rs-seq N            recurrent snapshot ring depth (default 16, 8 from --parallel 8; bounds O(1) rollback and draft k)\n"
+        "  --n-rs-seq N            rollback ring depth (default 16, and 8 with more than 8 streams; it bounds the draft length:\n"
+        "                          with 8 a request that is alone writes 12% slower, 16 costs 2.3 GB at --parallel 32)\n"
         "  --device-slots N        prompt states kept on the device for reuse (extra sequences; default 4, 8 from\n"
         "                          --parallel 4; 0 = host snapshots). All but two can hold the end of a long system\n"
         "                          prompt: an agent with more roles than that should raise it\n"
@@ -75,7 +80,7 @@ void usage() {
         "                          +5% aggregate at 32 streams, +10% document prefill; 36 covers the large matrices of a\n"
         "                          27B model, 54 all of them (default 0 = off)\n"
         "  --no-gpu-sampler        host argmax instead of the GPU backend sampler\n"
-        "  --no-mtp-load           do not create the embedded MTP draft context\n"
+        "  --no-mtp-load           do not load the embedded MTP draft head (also --no-mtp; implied by --draft-model)\n"
         "  --no-prefix-cache       disable cross-request KV/state reuse\n"
         "  --no-warmup             skip the startup warm-up forward (first request then pays the cold start)\n"
         "  --prefix-cache-slots N  post-prefill snapshots kept for prefix reuse (default 4)\n"
@@ -97,6 +102,8 @@ int main(int argc, char** argv) {
     std::string mtp_draft_vocab_path; // token-id list for the external MTP head (scripts/draft_vocab.py)
     std::string mmproj_path;          // projector file: image input
     uint32_t reserve_interactive = 0; // slots kept free of "priority": "background" requests
+    uint32_t sse_keepalive_s = 15;    // a silent stream gets an SSE comment line after this many seconds (0 = never)
+    bool merge_prompt_loads = false;  // prompts of requests that arrive together load in shared passes (--merge-loads)
     uint32_t image_min_tokens = 0;
     uint32_t image_max_tokens = 0;
     std::string model_name;
@@ -161,6 +168,9 @@ int main(int argc, char** argv) {
         else if (arg == "--mtp-draft-vocab") mtp_draft_vocab_path = next();
         else if (arg == "--mmproj") mmproj_path = next();
         else if (arg == "--reserve-interactive") reserve_interactive = static_cast<uint32_t>(need_int("--reserve-interactive", next(), 0, 64));
+        else if (arg == "--merge-loads") merge_prompt_loads = true;
+        else if (arg == "--no-merge-loads") merge_prompt_loads = false;
+        else if (arg == "--sse-keepalive") sse_keepalive_s = static_cast<uint32_t>(need_int("--sse-keepalive", next(), 0, 3600));
         else if (arg == "--image-min-tokens") image_min_tokens = static_cast<uint32_t>(need_int("--image-min-tokens", next(), 1, 16384));
         else if (arg == "--image-max-tokens") image_max_tokens = static_cast<uint32_t>(need_int("--image-max-tokens", next(), 1, 16384));
         else if (arg == "--model-name") model_name = next();
@@ -193,7 +203,7 @@ int main(int argc, char** argv) {
         else if (arg == "--wide-copy-gb") wide_copy_gb = static_cast<uint32_t>(need_int("--wide-copy-gb", next(), 0, 96));
         else if (arg == "--device-slots") { device_slots = static_cast<uint32_t>(need_int("--device-slots", next(), 0, 32)); device_slots_set = true; }
         else if (arg == "--no-gpu-sampler") gpu_sampler = false;
-        else if (arg == "--no-mtp-load") load_mtp = false;
+        else if (arg == "--no-mtp-load" || arg == "--no-mtp") load_mtp = false;
         else if (arg == "--no-spec") disable_speculation = true;
         else if (arg == "--no-warmup") warmup = false;
         else if (arg == "--no-prefix-cache") enable_prefix_cache = false;
@@ -214,6 +224,8 @@ int main(int argc, char** argv) {
     max_concurrent = std::max(max_concurrent, parallel);
     scfg.max_concurrent_requests = max_concurrent;
     scfg.reserve_interactive = reserve_interactive;
+    scfg.sse_keepalive_ms = sse_keepalive_s * 1000u;
+    scfg.merge_prompt_loads = merge_prompt_loads;
     scfg.execution_mode = mode;
     scfg.n_ctx = n_ctx;
     scfg.draft_k = spec_k;
@@ -318,7 +330,10 @@ int main(int argc, char** argv) {
         lopts.kv_type_v = kv_type_v;
         // From 8 streams the shared draft length is 3 (shared_draft_k), and every sequence pays the ring in memory
         // (151 MB per row and sequence for Qwen3.8-27B): 8 deep is ample there, 16 does not fit 32 streams on Thor.
-        if (!n_rs_seq_set && parallel >= 8) n_rs_seq = 8;
+        // The 8-deep ring caps drafts at 8 tokens: a request that is alone then writes 48.5 instead of 55.1 tok/s.
+        // At --parallel 8 the 16-deep ring costs 0.9 GB and eight streams at once nothing (benchmarks 54.7), so
+        // it stays; above that the ring is 8 unless --n-rs-seq says otherwise.
+        if (!n_rs_seq_set && parallel > 8) n_rs_seq = 8;
         // several requests at once are agents as a rule: roles with their own long system prompts (up to six here)
         if (!device_slots_set && parallel >= 4) device_slots = 8;
         lopts.n_rs_seq = n_rs_seq;

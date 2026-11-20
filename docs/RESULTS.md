@@ -5,7 +5,61 @@ greedy, identical prompts for every engine, 256 generated tokens. The 1.0.0-rc2 
 the 1.0.0-rc1 rows on 2026-11-14, each on the files of its released archive, with nothing else on the GPU; rows of
 other versions and engines carry their own date or version. The 1.0.0-rc3 rows were measured on 2026-11-17 on the
 files of its archive; other work used the machine's CPU cores that day, so where rc3 is compared with rc2 the two
-ran in turn.
+ran in turn. The 1.0.0 rows were measured on 2026-11-20 on the files of its archive, on the machine alone after a
+restart.
+
+## 1.0.0
+
+| | 1.0.0 | 1.0.0-rc3 |
+|---|---|---|
+| One stream over 60 prompts (`scripts/speed_set.py`) | 55.0 tok/s, 113.9 ms a step, 6.27 tokens accepted a step | 54.7 tok/s, 114.5 ms, 6.27 |
+| The same, alone on a server started with `--parallel 8` | 55 tok/s | 48.5 tok/s |
+| 1 / 2 / 4 requests at once, the five-prompt test (`--parallel 4`) | 38.6 / 75.6 / 105.2 tok/s | 41.3 / 72.2 / 109.6 |
+| 8 / 16 / 32 requests at once, the five-prompt test (`--parallel 32`) | 136.2 / 165.2 / 180.0 tok/s | 130.7 / 155.7 / 183.2 (means of three runs) |
+| 8 / 16 / 32 requests at once, a prompt of its own for every request: while writing | 125.2 / 146.6 / 151.6 tok/s | 16 at once: 144.0 to 147.0 |
+| ... over the whole run, prompt loading included | 115.6 / 133.0 / 134.3 tok/s | 16 at once: 130.0 to 135.7 |
+| Quality gate (GSM8K / HumanEval / tools / needle) | GSM8K 28/30, HumanEval 19/20, tool calls and needle pass | 28/30, 19/20, pass, pass |
+| Structured answers: agent schemas / general schemas, one stream; the same with 8 streams | 30/30, 90/90; 30/30, 90/90 (sampled 89/90, one cut at `max_tokens`; with reasoning 30/30) | 30/30, 88/90; 30/30, 90/90 |
+| 16 agents with an 18k-token prompt each: all turns; next turn median / worst | 567 s; 2.9 / 3.1 s | 567 s; 3.0 / 3.5 s |
+| Role calls, 1 / 5 / 8 sessions: seconds a call | 1.3 / 4.6 / 6.9 s | 1.3 / 4.5 / 6.6 |
+| A sampled answer after a greedy one (`scripts/sampling_check.py`) | 45 of 45 right | 45 of 45 |
+| Four requests for one 4,100-token prompt sent together: tokens each loads; all answered after | 4,041 / 0 / 0 / 0; 8.0 s | 4,165 each; 31.2 s |
+| A second question about a 3,000-token document, ten other prompts later: tokens loaded, seconds | 20 of 3,052; 0.5 s (unmarked: all 2,539; 3.9 s) | all 3,434; 5.2 s |
+| Answers identical with and without drafts (`scripts/exact_check.py`, 12 prompts); speed with / without | 9 of 12; 39.3 / 12.0 tok/s | (no such request field) |
+| First token of a turn: alone / next to four background requests | 0.14 s / 0.17 s (0.23 s at worst) | 0.14 s / 0.17 to 0.26 s |
+| Qwen3.8-Flash-Next, loading a prompt of 4,402 / 18,552 tokens | 7.6 / 31.1 s (576 / 597 tok/s) | 13.9 / 56.4 s (318 / 329 tok/s) |
+| Qwen3.8-Flash-Next, one pass of 256 / 512 / 2,048 prompt rows | 0.58 / 0.87 / 2.51 s | 0.58 / 1.42 / 4.65 s |
+| Qwen3.8-Flash-Next, a 131-token function through the launcher | 54.7 tok/s, 4.47 tokens accepted a step | 54.9 tok/s, 4.47 |
+
+- **The two stream tests.** `scripts/concurrency_bench.py` sends the same five prompts from every stream, and every
+  release so far was measured with it; its totals include prompt loads that the server answers from kept states.
+  `scripts/streams_bench.py` gives every request a prompt of its own (240 prompts: math, code, everyday questions)
+  and reports what the streams write while they write, and the whole run. With 32 different requests at once the
+  engine writes 152 tok/s, and 134 tok/s over the whole run; the 180 of the five-prompt test is what a client gets
+  whose requests repeat. Five starts of rc3 on the day gave 144.0 to 147.0 and 130.0 to 135.7 at 16 streams.
+- **The same prompt from several requests.** Until rc3 each request loaded it. Now the first loads it and the
+  others start from its state, at any prompt length. `n` choices in one request did this before; a client that
+  streams cannot use `n`.
+- **A state where the client marks it.** `"cache_control": {"type": "ephemeral"}` on a content part keeps what was
+  computed up to its end, as the end of a long system prompt is kept without being asked.
+- **With and without drafts.** `"draft": false` decodes a request without drafts. The answers that differ part
+  ways after a few hundred characters, at a word where two candidates were nearly tied: a pass that verifies sixteen
+  rows runs other kernels than a pass with one row and rounds differently. The quality gate gives the same scores
+  with drafts as the plain decoding of earlier versions did.
+- **Sampling.** At temperature 0.7 (`top_p` 0.8) the 60 prompts run at 50.8 tok/s and at 1.0 (`top_p` 0.95) at
+  48.5 against 55 greedy (measured on rc3, whose sampling code 1.0.0 has): the model accepts as many drafted tokens
+  a step at 0.7 as when greedy (6.25 against 6.27; 5.90 at 1.0), and a step takes 8% longer because every verified
+  row of logits is searched on the host. Eight sampled requests at once write 119 tok/s against 128 greedy.
+- **Where the time of a role call goes** (`scripts/roles_bench.py --parts`): alone, 1.3 s is 0.65 s for loading
+  the 243 new tokens and 0.7 s for writing 21, with a hundredth of a second for everything else. With five
+  sessions a call waits behind the prompt loads of the others, which hold the device one after another.
+  `--wide-copy-gb 36` (a second copy of the large weight matrices for wide passes, 36 GB) loads the 243 tokens in
+  0.47 s and brings a call with five sessions from 4.4 to 3.7 s; `--merge-loads` loads the prompts of requests
+  that arrive at the same moment in shared passes (five requests of 200 to 300 tokens sent at once: all answered
+  after 3.6 s instead of 4.4 s) and changes nothing for calls that follow each other. These two were measured on
+  the development build of the same day, a few hours before the archive was made.
+- **Memory state.** Whether the page cache is empty or holds 82 GiB of other files when the model loads makes no
+  difference to its speed (55.0 to 55.8 tok/s over five starts).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../assets/engines-dark.svg">

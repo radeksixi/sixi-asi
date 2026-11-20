@@ -143,6 +143,7 @@ struct ChatMessage {
     std::vector<ChatToolCallRef> tool_calls; // assistant history: prior tool calls
     std::string tool_call_id;                // tool role: id of the call being answered
     std::string name;                        // tool role: function name (optional)
+    std::vector<size_t> cache_marks;         // byte offsets in content where a part with "cache_control" ended: keep a state there
 };
 
 // Chat template support. Qwen3.8 ships a Jinja template that llama_chat_apply_template cannot run, so the
@@ -184,6 +185,8 @@ struct ChatCompletionRequest {
     TokenBudgetConfig budgets;
     core::SamplingParams sampling;
     bool stream = false;
+    bool stream_include_usage = false;      // "stream_options": {"include_usage": true}: one more chunk with no choices that carries the usage
+    bool draft = true;                      // "draft": false decodes this request without drafts (what a drafted answer is compared with)
     uint32_t n = 1;                         // choices per request: n samples with seeds seed..seed+n-1, decoded as parallel streams (non-streaming only)
     // n > 1 with "vote": the samples vote on the answer and the response carries one choice, a sample that gave the
     // winning answer. The answer of a sample is the last match of vote_regex (group 1 if it has one); without a
@@ -242,6 +245,7 @@ struct RuntimeMetrics {
     uint64_t completed_requests = 0;
     uint64_t cancelled_requests = 0;
     uint64_t admission_rejected_requests = 0;
+    uint64_t prefix_cache_hits_after_queue = 0;   // long prompt loads that found the prompt loaded by the request in front of them
     uint64_t numeric_error_requests = 0;
     uint64_t tool_validation_errors = 0;
     uint64_t fallback_events = 0;
@@ -272,6 +276,7 @@ struct ServerConfig {
     // once and batches their forward passes.
     uint32_t max_concurrent_requests = 1;
     uint32_t reserve_interactive = 0;       // slots that requests with "priority": "background" never take
+    uint32_t sse_keepalive_ms = 15000;      // a stream silent for this long gets an SSE comment line (0 = never)
     uint32_t n_ctx = 4096;                  // context window of the backend (caps prompt + max_tokens)
     ExecutionMode execution_mode = ExecutionMode::StrictReplay;
     uint32_t draft_k = 0;                   // 0 = auto (backend rollback window, capped at 7 = llama.cpp MMVQ batch limit - 1)
@@ -281,6 +286,9 @@ struct ServerConfig {
     uint32_t max_adaptive_k = 7;            // upper bound for the per-step draft length (also capped by the rollback window)
     bool use_neural_drafter = true;         // use the backend-embedded MTP / DFlash2 drafter when present
     bool enable_prefix_cache = true;        // reuse backend state across requests sharing a token prefix
+    bool merge_prompt_loads = false;        // prompts of requests that arrive together load in shared passes (several streams).
+                                            // Off by default: 17-21% less time for a burst of similar prompts, nothing for calls
+                                            // that arrive one after another, and a later first token for short prompts (benchmarks 59)
     uint32_t prefix_cache_slots = 4;        // LRU depth of post-prefill snapshots (each ~ KV + recurrent state)
     uint32_t min_snapshot_tokens = 64;      // post-prefill snapshot (host copy, ~0.15-0.3 s) pays off from ~64 tokens when prompts repeat
     std::string snapshot_dir;               // optional: persist long-prompt snapshots to this directory (NVMe session cache)

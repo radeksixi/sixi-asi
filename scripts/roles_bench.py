@@ -32,11 +32,12 @@ def system_prompt(role, tokens, rnd):
             "Answer with exactly one JSON object {\"role\": \"%s\", \"note\": <one short sentence>} and nothing else." % (role, body, role))
 
 
-def call(url, system, user, max_tokens, background):
+def call(url, system, user, max_tokens, background, more=None):
     body = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "max_tokens": max_tokens, "temperature": 0, "enable_thinking": False}
     if background:
         body["priority"] = "background"
+    body.update(more or {})
     t = time.time()
     req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
     busy = 0
@@ -51,8 +52,12 @@ def call(url, system, user, max_tokens, background):
             busy += 1
             time.sleep(0.2)
     u = r.get("usage") or {}
-    return {"s": time.time() - t, "busy": busy, "in": u.get("prompt_tokens", 0), "cached": u.get("prompt_cached_tokens", 0), "out": u.get("completion_tokens", 0),
-            "prefill_ms": (r.get("metrics") or {}).get("prefill_ms", 0.0), "text": r["choices"][0]["message"].get("content") or ""}
+    m = r.get("metrics") or {}
+    out = u.get("completion_tokens", 0)
+    rate = m.get("decode_tok_per_s") or 0.0
+    return {"s": time.time() - t, "busy": busy, "in": u.get("prompt_tokens", 0), "cached": u.get("prompt_cached_tokens", 0), "out": out,
+            "prefill_ms": m.get("prefill_ms", 0.0), "snapshot_ms": m.get("snapshot_ms", 0.0), "first_token_ms": m.get("ttft_ms", 0.0),
+            "decode_ms": (1000.0 * out / rate) if rate > 0 else 0.0, "text": r["choices"][0]["message"].get("content") or ""}
 
 
 def main():
@@ -64,6 +69,8 @@ def main():
     ap.add_argument("--system-tokens", type=int, default=1500)
     ap.add_argument("--max-tokens", type=int, default=60)
     ap.add_argument("--background", action="store_true", help="send every call with priority background")
+    ap.add_argument("--json-object", action="store_true", help="send response_format json_object, so that every answer is decoded under a grammar")
+    ap.add_argument("--parts", action="store_true", help="also print where the time of a call goes")
     ap.add_argument("--out", default="")
     ap.add_argument("--compare", default="", help="an --out file of an earlier run with the same arguments: count the answers that are the same text")
     a = ap.parse_args()
@@ -79,7 +86,7 @@ def main():
             history.append("Caller: " + " ".join(rnd.choice(WORDS) for _ in range(25)) + ".")
             for ri, system in enumerate(systems):
                 user = "Conversation so far:\n" + "\n".join(history) + "\n\nDo your part for the last line."
-                r = call(a.url, system, user, a.max_tokens, a.background)
+                r = call(a.url, system, user, a.max_tokens, a.background, {"response_format": {"type": "json_object"}} if a.json_object else None)
                 r.update({"session": sid, "turn": turn, "role": ri})
                 with lock:
                     rows.append(r)
@@ -104,6 +111,13 @@ def main():
           "%d prompt tokens a call, %.0f%% of them cached; %d tokens out%s" % (a.sessions, summary["call_s_median"], summary["call_s_first_turn"], a.roles,
                                                                            summary["turn_s_median"], summary["calls_per_s"], summary["prompt_tokens_per_call"], 100 * summary["cached_share"], summary["out_tokens_per_call"],
                                                                            "" if not summary["calls_answered_429_first"] else "; %d of %d calls had to wait for a slot (429, tried again)" % (summary["calls_answered_429_first"], len(rows))), flush=True)
+    if a.parts:
+        med = lambda k: statistics.median(r.get(k, 0.0) for r in use)   # noqa: E731
+        rest = statistics.median(1000.0 * r["s"] - r.get("prefill_ms", 0.0) - r.get("snapshot_ms", 0.0) - r.get("decode_ms", 0.0) for r in use)
+        summary["parts_ms_median"] = {"call": 1000.0 * summary["call_s_median"], "prompt_load": med("prefill_ms"), "state_save": med("snapshot_ms"),
+                                      "decode": med("decode_ms"), "rest": rest, "first_token": med("first_token_ms")}
+        print("   of a call (medians, ms): prompt load %.0f (%d new tokens), keeping the state %.0f, writing %d tokens %.0f, the rest %.0f (waiting for a slot or the device, setup)"
+              % (med("prefill_ms"), statistics.median(r["in"] - r["cached"] for r in use), med("snapshot_ms"), statistics.median(r["out"] for r in use), med("decode_ms"), rest))
     if a.compare:
         with open(a.compare) as f:
             before = {(r["session"], r["turn"], r["role"]): r.get("text") for r in json.load(f)["rows"]}

@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 382" width="860" height="382" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="Total throughput with concurrent requests: 0.10 and 1.0.0-rc2">
-<title>Total throughput with concurrent requests: 0.10 and 1.0.0-rc2</title><desc>Qwen3.8-27B Q4_K_M + DSpine on Jetson AGX Thor, greedy, 256 tokens per answer, prompt loading included.</desc>
+<title>Total throughput with concurrent requests: 0.10 and 1.0.0-rc2</title><desc>Qwen3.8-27B Q4_K_M + DSpine on Jetson AGX Thor, greedy, 256 tokens per answer; every stream sends the same five prompts, prompt loading included.</desc>
 <rect width="860" height="382" rx="8" fill="#fcfcfb"/>
 <text x="24.0" y="30.0" fill="#0b0b0b" font-size="16" text-anchor="start" font-weight="600">Total throughput with concurrent requests: 0.10 and 1.0.0-rc2</text>
-<text x="24.0" y="50.0" fill="#52514e" font-size="12" text-anchor="start" font-weight="400">Qwen3.8-27B Q4_K_M + DSpine on Jetson AGX Thor, greedy, 256 tokens per answer, prompt loading included.</text>
+<text x="24.0" y="50.0" fill="#52514e" font-size="12" text-anchor="start" font-weight="400">Qwen3.8-27B Q4_K_M + DSpine on Jetson AGX Thor, greedy, 256 tokens per answer; every stream sends the same five prompts, prompt loading included.</text>
 <rect x="24" y="64" width="12" height="12" rx="3" fill="#eb6834"/>
 <text x="42.0" y="74.0" fill="#52514e" font-size="12" text-anchor="start" font-weight="400">0.10</text>
 <rect x="80.4" y="64" width="12" height="12" rx="3" fill="#2a78d6"/>

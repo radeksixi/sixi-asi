@@ -326,7 +326,7 @@ int main(int argc, char** argv) {
         else if (arg == "--threads" && i + 1 < argc) n_threads = static_cast<uint32_t>(std::stoul(argv[++i]));
         else if (arg == "--n-batch" && i + 1 < argc) n_batch = static_cast<uint32_t>(std::stoul(argv[++i]));
         else if (arg == "--no-gpu-sampler") gpu_sampler = false;
-        else if (arg == "--no-mtp-load") load_mtp = false;
+        else if (arg == "--no-mtp-load" || arg == "--no-mtp") load_mtp = false;
         else if (arg == "--no-q8-stage") q8_stage = false;
         else if (arg == "--no-ple-device") ple_device = false;
         else if (arg == "--ple-device") ple_device = true;

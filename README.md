@@ -3,12 +3,13 @@
 Run Qwen3.8 on an NVIDIA Jetson AGX Thor. An inference engine with speculative decoding that leaves the answers
 unchanged, parallel streams and an OpenAI-compatible API, as one download.
 
-Measured with Qwen3.8-27B on an NVIDIA Jetson AGX Thor: **43 tok/s on one stream** (3.6x plain decoding at 12.1)
-and **over 170 tok/s in total with 32 requests at once**. [How it was measured](docs/RESULTS.md).
+Measured with Qwen3.8-27B on an NVIDIA Jetson AGX Thor: **55 tok/s on one stream** over 60 prompts (plain
+decoding: 12) and **150 tok/s in total with 16 to 32 requests at once**, each with a prompt of its own.
+[How it was measured](docs/RESULTS.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/streams-dark.svg">
-  <img src="assets/streams-light.svg" alt="Total tokens per second with 4, 8, 16 and 32 concurrent requests on NVIDIA Jetson AGX Thor, Qwen3.8-27B Q4_K_M with the DSpine drafter. Version 0.10: 94.2, 113.5, 128.8, 129.4. Version 1.0.0-rc2: 104.8, 129.5, 156.0, 172.5." width="100%">
+  <img src="assets/streams-light.svg" alt="Total tokens per second with 4, 8, 16 and 32 concurrent requests that all send the same five prompts, on NVIDIA Jetson AGX Thor, Qwen3.8-27B Q4_K_M with the DSpine drafter. Version 0.10: 94.2, 113.5, 128.8, 129.4. Version 1.0.0-rc2: 104.8, 129.5, 156.0, 172.5." width="100%">
 </picture>
 
 ## Quick start
@@ -124,7 +125,11 @@ repositories, sizes and checksums). No model is part of this archive.
   answer and stops the rest once it is decided.
 - **Prompt cache.** A conversation continues from where it stopped, and a repeated prompt starts answering in
   1 ms; the cache can persist on disk. The end of a long system prompt is kept on its own, so every call of an
-  agent's role starts from there, whichever conversation it belongs to.
+  agent's role starts from there, whichever conversation it belongs to. A client can mark other places worth
+  keeping (`cache_control` on a content part: a document, a list of tools), and requests for the same prompt that
+  arrive together load it once.
+- **Checkable.** `"draft": false` answers one request without drafts, so anyone can compare the two answers on
+  the running server (`scripts/exact_check.py`).
 - **Short spoken answers in their language.** With the language in the request, a one-word answer ("nie", "ja",
   "non") is heard as that language and not as English.
 - **Native Qwen3.8 chat template** (tools, reasoning effort, thinking on/off); reasoning budgets that end the
@@ -132,25 +137,31 @@ repositories, sizes and checksums). No model is part of this archive.
 
 ## Performance
 
-NVIDIA Jetson AGX Thor, 1.0.0-rc3, measured on the files of this archive; the rows on spoken turns, the next
-turn about a picture and Flash-Next are from 1.0.0-rc2, which rc3 leaves as they were. Full tables, quality gates
-and the comparison with other engines are in [docs/RESULTS.md](docs/RESULTS.md); what changed in each version is
-in [CHANGELOG.md](CHANGELOG.md).
+NVIDIA Jetson AGX Thor, 1.0.0, measured on the files of this archive. The first row, the comparison with
+llama.cpp, the rows on speech and pictures and the decoding speed of Flash-Next are from the release candidates,
+whose decoding, speech and image code 1.0.0 leaves as it was. Full tables, quality gates and the comparison with
+other engines are in [docs/RESULTS.md](docs/RESULTS.md); what changed in each version is in
+[CHANGELOG.md](CHANGELOG.md).
 
 | | |
 |---|---|
 | Qwen3.8-27B, one stream, default weights (UD-Q4_K_XL v3.1) | 43.4 tok/s, 3.6x plain decoding |
-| The same over 60 prompts (math, code, everyday questions) | 54.7 tok/s (1.0.0-rc1: 51.4) |
-| Qwen3.8-27B, 2 / 4 / 8 / 32 requests at once, in total | 72 / 110 / 131 / 183 tok/s |
+| The same over 60 prompts (math, code, everyday questions) | 55.0 tok/s (1.0.0-rc1: 51.4), 12 without drafts |
+| Qwen3.8-27B, 2 / 4 / 8 / 32 requests at once, in total | 76 / 105 / 136 / 180 tok/s |
+| The same with a prompt of its own for every request, 8 / 16 / 32 at once | 125 / 147 / 152 tok/s while the streams write, 116 / 133 / 134 over the whole run |
 | llama.cpp v1.0.0 on the same machine and weights, built-in MTP drafts | 29.3 tok/s |
-| An agent's role call with a 1,500-token system prompt: alone / five sessions at once | 1.3 s / 4.5 s (1.0.0-rc2: 3.4 / 15.7) |
+| An agent's role call with a 1,500-token system prompt: alone / five sessions at once | 1.3 s / 4.6 s (1.0.0-rc2: 3.4 / 15.7) |
+| Four requests for one 4,100-token prompt sent together: all answered after | 8.0 s (1.0.0-rc3: 31.2 s) |
+| A second question about a 3,000-token document marked with `cache_control`, after ten other prompts | 0.5 s (unmarked: 4 s) |
 | 16 agents with an 18k-token prompt each: wait for the next turn | 3 s |
-| JSON answers that parse, with a schema (120 cases) | 118 of 120 (103 without the constraint) |
+| JSON answers that parse, with a schema (120 cases) | 120 of 120 (108 without the constraint) |
+| Answers that are the same with and without drafts (12 prompts, 256 tokens) | 9 of 12, 3.3x faster with drafts |
 | A turn next to four background requests: first token | 0.18-0.26 s |
 | A spoken question to the first audio of the answer (speech on the CPU) | 1.0-1.5 s |
 | One-word spoken answers of Polish speakers heard right, with the language given / without | 201 / 80 of 300 |
 | A picture: load / next turn about the same picture | 0.4-1.4 s / 0.1 s |
 | Qwen3.8-Flash-Next, one stream | 53 tok/s on code, 45 in conversation |
+| Qwen3.8-Flash-Next, loading a prompt of 18,500 tokens | 31 s, 600 tok/s (1.0.0-rc3: 56 s) |
 | Context memory for 32 streams | 27.1 GB |
 | Default weights against BF16 | KL divergence 0.008 |
 
@@ -165,6 +176,8 @@ python3 scripts/multistream_check.py --url http://127.0.0.1:8089 --streams 4
 python3 scripts/schema_eval.py --url http://127.0.0.1:8089 --compare-free
 python3 scripts/intel_eval.py --engines sixi=http://127.0.0.1:8089 --effort low --max-tokens 8192
 python3 scripts/speed_set.py --url http://127.0.0.1:8089          # one stream over 60 prompts
+python3 scripts/streams_bench.py --url http://127.0.0.1:8089 --streams 8    # many requests, each its own prompt
+python3 scripts/exact_check.py --url http://127.0.0.1:8089        # every prompt with and without drafts
 python3 scripts/sampling_check.py --url http://127.0.0.1:8089     # the same prompt greedy, then sampled
 python3 scripts/roles_bench.py --url http://127.0.0.1:8089 --sessions 5     # an agent's calls with long system prompts
 python3 scripts/image_digits_check.py --url http://127.0.0.1:8089           # numbers in small pictures
@@ -176,11 +189,11 @@ reference's, so any OpenAI-compatible server on the same machine can be put next
 
 ## Build from source
 
-The engine's sources in this repository are those of 1.0.0-rc3 (Apache-2.0). They build the programs of the
+The engine's sources in this repository are those of 1.0.0 (Apache-2.0). They build the programs of the
 archive (`sixi-server`, `sixi-cli`, `sixi-bench`), the library behind them and the tests:
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DSIXI_VERSION_SUFFIX=-rc3
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSIXI_VERSION_SUFFIX=
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
@@ -190,7 +203,7 @@ You need CMake 3.24 or newer, a C++20 compiler, OpenSSL, and the CUDA toolkit fo
 published in binary form: take `lib/libllama.so` from the release archive and name it to the engine,
 
 ```bash
-SIXI_LLAMA_LIB_PATH=/path/to/sixi-asi-1.0.0-rc3-jetson-thor-aarch64/lib/libllama.so \
+SIXI_LLAMA_LIB_PATH=/path/to/sixi-asi-1.0.0-jetson-thor-aarch64/lib/libllama.so \
   build/sixi-server --model model.gguf --draft-model drafter.gguf --port 8089
 ```
 
@@ -202,8 +215,7 @@ to llama.cpp v1.0.0 that 1.0 runs on are not published; they are in the archive'
 
 ## License
 
-The sources in this repository are Apache-2.0 (`LICENSE`). The release archive is free to use for any purpose and
-to pass on unchanged: see its `LICENSE` file (`LICENSE-BINARY` in this repository). It includes llama.cpp,
-cpp-httplib and nlohmann/json under their MIT licenses (`licenses/`). The backend library of 1.0 (llama.cpp v1.0.0
-with this engine's kernel and drafter changes) is released in binary form; the `sixi` and `sixi-speech` commands
-and the measurement scripts are plain Python.
+Free to use for any purpose and to pass on unchanged: see `LICENSE`. The archive includes llama.cpp, cpp-httplib
+and nlohmann/json under their MIT licenses (`licenses/`). The engine's sources are in the repository
+(Apache-2.0); the backend library (llama.cpp v1.0.0 with this engine's kernel and drafter changes) is released in
+binary form, and the `sixi` and `sixi-speech` commands and the measurement scripts are plain Python.

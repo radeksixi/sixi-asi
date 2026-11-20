@@ -1427,7 +1427,8 @@ struct LlamaCppBackend::Impl {
     // ownership flag. Batched ops queue in `pending`; one waiting thread becomes the leader, gathers the ops of
     // all generating streams (bounded wait) and runs them in a single llama_decode.
     struct BatchOp {
-        enum class Kind : uint8_t { Draft, Verify } kind = Kind::Verify;
+        enum class Kind : uint8_t { Draft, Verify, Prefill } kind = Kind::Verify;
+        bool announced = false;                         // prefill: the request called announce_prompt_load()
         uint32_t stream = 0;
         const std::vector<int32_t>* tokens = nullptr;   // verify: rows to append to the stream
         bool want_logits = false;                       // verify: full logits rows instead of GPU argmax ids
@@ -1454,6 +1455,11 @@ struct LlamaCppBackend::Impl {
     double last_pass_ms = 0.0;   // duration of the last shared pass (rendezvous window scale)
     uint32_t n_generating = 0;
     std::vector<BatchOp*> pending;
+    // Prompt loads that wait to share their passes (submit_prefill), and the requests that have said they will load
+    // a prompt and have not arrived yet
+    std::vector<BatchOp*> pending_prefill;
+    bool prefill_leader_active = false;
+    uint32_t prefill_announced = 0;
 
     void gpu_acquire() {
         std::unique_lock<std::mutex> lk(q_mu);
@@ -1535,7 +1541,47 @@ struct LlamaCppBackend::Impl {
     void run_group(std::vector<BatchOp*>& grp);   // defined after the class (needs the backend helpers)
     void exec_verify_group(std::vector<BatchOp*>& grp);
     void exec_draft_group(std::vector<BatchOp*>& grp);
+    void exec_prefill_group(std::vector<BatchOp*>& grp);
     Status settle_pads();
+
+    // How long the first of several prompt loads waits for the announced others (SIXI_PREFILL_MERGE_MS, default 80)
+    static std::chrono::milliseconds merge_window() noexcept {
+        static const long ms = [] {
+            const char* e = std::getenv("SIXI_PREFILL_MERGE_MS");
+            const long v = (e != nullptr && *e != '\0') ? std::atol(e) : 80L;
+            return std::max(0L, v);
+        }();
+        return std::chrono::milliseconds(ms);
+    }
+    // A prompt load that shares its passes with the loads of the requests that arrive with it. The first thread to
+    // arrive leads: it waits until the announced requests are here (or the window is over), takes the device as any
+    // work outside a shared decode pass does, and loads all of them (exec_prefill_group). A request that is alone
+    // has nobody to wait for and starts at once.
+    void submit_prefill(BatchOp& op) {
+        op.stream = cur_stream();
+        std::unique_lock<std::mutex> lk(q_mu);
+        if (op.announced && prefill_announced > 0) --prefill_announced;
+        pending_prefill.push_back(&op);
+        q_cv.notify_all();
+        while (!op.done) {
+            if (prefill_leader_active) { q_cv.wait(lk); continue; }
+            prefill_leader_active = true;
+            q_cv.wait_for(lk, merge_window(), [&] { return prefill_announced == 0; });
+            std::vector<BatchOp*> grp;
+            grp.swap(pending_prefill);
+            lk.unlock();
+            {
+                GpuHold hold(this);
+                exec_prefill_group(grp);
+            }
+            lk.lock();
+            for (BatchOp* o : grp) o->done = true;
+            telemetry.merged_prefill_groups++;
+            telemetry.merged_prefill_loads += grp.size();
+            prefill_leader_active = false;
+            q_cv.notify_all();
+        }
+    }
 
     // Run one batched op for the calling thread's stream. A generating stream queues the op so that concurrent
     // streams share one forward pass; otherwise the op runs alone.
@@ -2100,6 +2146,123 @@ Status LlamaCppBackend::Impl::settle_pads() {
     }
     return ok ? Status::Ok()
               : Status::Error(ErrorCode::BackendError, "llama_memory_seq_rm failed to remove pad rows at position " + std::to_string(p0));
+}
+
+// Forward passes over the prompt rows of several streams that load at the same time. A pass takes as many rows
+// from every stream as the stream with the fewest left has (llama.cpp keeps sequences in one ubatch only when they
+// contribute equally many tokens, and a second ubatch is a second read of the weights); a stream that is done
+// leaves and the others go on. On the Thor a pass under 320 rows multiplies on the quantized kernel at ~2.7 ms a
+// row, a wider one on the tensor cores at 0.8 ms a row after 520 ms for the weights: the 243 new tokens of a role
+// call cost 650 ms alone, five such loads together 1.5 s instead of 3.2 s.
+void LlamaCppBackend::Impl::exec_prefill_group(std::vector<BatchOp*>& grp) {
+    struct Load { BatchOp* op; uint32_t stream; size_t done; };
+    std::sort(grp.begin(), grp.end(), [](const BatchOp* a, const BatchOp* b) { return a->stream < b->stream; });
+    std::vector<Load> loads;
+    for (BatchOp* op : grp) {
+        ActAs act(op->stream);
+        if (Status sp_st = settle_pads(); !sp_st.ok()) {
+            op->st = sp_st;
+            continue;
+        }
+        loads.push_back(Load{op, op->stream, 0});
+    }
+    const size_t max_rows = (opts.n_batch > 0) ? opts.n_batch : 512u;
+    size_t rows_before = 0;
+    while (true) {
+        std::vector<Load*> now;
+        size_t R = SIZE_MAX;
+        for (Load& l : loads) {
+            if (!l.op->st.ok() || l.done >= l.op->tokens->size()) continue;
+            now.push_back(&l);
+            R = std::min(R, l.op->tokens->size() - l.done);
+        }
+        if (now.empty()) {
+            break;
+        }
+        R = std::max<size_t>(1u, std::min(R, max_rows / now.size()));
+        const size_t total = R * now.size();
+        // between two large passes the generating streams get the device, as between the chunks of one long prompt
+        if (rows_before > 0 && total >= 256) {
+            gpu_yield(static_cast<int32_t>(rows_before));
+        }
+        std::vector<int32_t> tok(total), pos(total), n_seq(total, 1), seq_vals(now.size());
+        std::vector<int32_t*> seq_ptr(total);
+        std::vector<int8_t> flags(total, 0);
+        std::vector<size_t> base(now.size());
+        for (size_t si = 0; si < now.size(); ++si) {
+            const Load& l = *now[si];
+            base[si] = streams[l.stream].history_tokens.size();
+            seq_vals[si] = static_cast<int32_t>(l.stream);
+            for (size_t j = 0; j < R; ++j) {
+                tok[si * R + j] = (*l.op->tokens)[l.done + j];
+                pos[si * R + j] = static_cast<int32_t>(base[si] + j);
+                seq_ptr[si * R + j] = &seq_vals[si];
+            }
+            if (l.done + R == l.op->tokens->size()) {
+                flags[si * R + R - 1] = 1;   // the last prompt token: the request reads what follows it
+            }
+        }
+        prefetch_ple_for_chunk(tok.data(), static_cast<int32_t>(total));
+
+        LlamaBatchRaw batch{};
+        batch.n_tokens = static_cast<int32_t>(total);
+        batch.token = tok.data();
+        batch.pos = pos.data();
+        batch.n_seq_id = n_seq.data();
+        batch.seq_id = seq_ptr.data();
+        batch.logits = flags.data();
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const int32_t rc = llama_decode(ctx, batch);
+        const auto t1 = std::chrono::steady_clock::now();
+        if (rc != 0) {
+            void* mem = llama_get_memory(ctx);
+            for (size_t si = 0; si < now.size(); ++si) {
+                if (mem != nullptr && llama_memory_seq_rm != nullptr) {
+                    (void)llama_memory_seq_rm(mem, static_cast<int32_t>(now[si]->stream), static_cast<int32_t>(base[si]), -1);
+                }
+                now[si]->op->st = Status::Error(ErrorCode::BackendError, "llama_decode failed in a shared prompt load with code " + std::to_string(rc));
+            }
+            continue;
+        }
+        const double pass_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        observe_step_timing(pass_ms, static_cast<int32_t>(total));
+        if (trace_prefill()) {
+            std::fprintf(stderr, "sixi-asi: shared prompt load streams=%zu rows=%zu each=%zu ms=%.1f\n", now.size(), total, R, pass_ms);
+        }
+        for (size_t si = 0; si < now.size(); ++si) {
+            Load& l = *now[si];
+            ActAs act(l.stream);
+            auto& st = S();
+            st.history_tokens.insert(st.history_tokens.end(), l.op->tokens->begin() + static_cast<std::ptrdiff_t>(l.done),
+                                     l.op->tokens->begin() + static_cast<std::ptrdiff_t>(l.done + R));
+            record_target_h_nextn_and_dflash(static_cast<int32_t>(R), base[si], si * R);
+            l.done += R;
+            if (l.done < l.op->tokens->size()) {
+                continue;
+            }
+            const int32_t row = static_cast<int32_t>(si * R + R - 1);
+            const bool gpu_ids = !l.op->want_logits && st.gpu_sampler_attached && llama_get_sampled_token_ith != nullptr;
+            if (gpu_ids) {
+                const int32_t sampled = llama_get_sampled_token_ith(ctx, row);
+                if (sampled < 0 || static_cast<uint64_t>(sampled) >= n_vocab) {
+                    l.op->st = Status::Error(ErrorCode::BackendError, "llama_get_sampled_token_ith returned an invalid token after a shared prompt load");
+                    continue;
+                }
+                l.op->sampled.push_back(sampled);
+                st.last_sampled_token = sampled;
+                continue;
+            }
+            const float* raw = llama_get_logits_ith(ctx, row);
+            if (raw == nullptr) {
+                l.op->st = Status::Error(ErrorCode::BackendError, "llama_get_logits_ith returned null after a shared prompt load");
+                continue;
+            }
+            l.op->logits.emplace_back(raw, raw + n_vocab);
+            st.last_sampled_token = DeterministicSampler::sample_greedy_argmax(raw, n_vocab);
+        }
+        rows_before = total;
+    }
 }
 
 // One forward pass over the verify rows of several streams. Rows are laid out stream-major in ascending sequence
@@ -2701,8 +2864,14 @@ Status LlamaCppBackend::load_model(const LoadOptions& opts) {
         SIXI_MODEL_SET(mparams, load_mode, (opts.use_mmap && opts.use_mlock) ? 3 : (opts.use_mmap ? 1 : (opts.use_mlock ? 2 : 0)));
     }
 
+    // A block drafter (--draft-model) replaces the chained MTP head. With one given (and no --mtp-model next to
+    // it) the head is not loaded: until 1.0.0-rc3 its weights stayed in memory and its context was created and
+    // freed again once the drafter was in, which a card with little memory left could not afford.
+    const bool block_drafter_given =
+        !opts.draft_model_path.empty() && opts.mtp_model_path.empty() && std::filesystem::exists(opts.draft_model_path);
     const bool can_load_mtp =
         opts.load_embedded_mtp &&
+        !block_drafter_given &&
         opts.n_streams <= 1u &&
         impl_->telemetry.abi_canary_verified &&
         (impl_->llama_model_n_layer_nextn != nullptr) &&
@@ -4434,6 +4603,69 @@ void LlamaCppBackend::begin_setup() noexcept {
 
 void LlamaCppBackend::end_setup() noexcept {
     if (impl_ && impl_->n_streams > 1) impl_->gpu_release();
+}
+
+void LlamaCppBackend::announce_prompt_load() noexcept {
+    if (!impl_ || impl_->n_streams <= 1) return;
+    std::lock_guard<std::mutex> lk(impl_->q_mu);
+    ++impl_->prefill_announced;
+}
+
+void LlamaCppBackend::retract_prompt_load() noexcept {
+    if (!impl_ || impl_->n_streams <= 1) return;
+    {
+        std::lock_guard<std::mutex> lk(impl_->q_mu);
+        if (impl_->prefill_announced > 0) --impl_->prefill_announced;
+    }
+    impl_->q_cv.notify_all();
+}
+
+Result<std::vector<float>> LlamaCppBackend::forward_tokens_merged(const std::vector<int32_t>& input_tokens, bool announced) {
+    using Row = Result<std::vector<float>>;
+    bool shared = is_loaded() && impl_->n_streams > 1 && !input_tokens.empty() && !impl_->S().generating && !Impl::tls_background();
+    for (size_t i = 0; shared && i < input_tokens.size(); ++i) {
+        shared = !IBackend::is_image_token(input_tokens[i]);   // an image is decoded by its own path
+    }
+    if (!shared) {
+        if (announced) retract_prompt_load();
+        return forward_tokens(input_tokens, 0);
+    }
+    Impl::BatchOp op;
+    op.kind = Impl::BatchOp::Kind::Prefill;
+    op.tokens = &input_tokens;
+    op.want_logits = !supports_gpu_greedy_sampling();
+    op.announced = announced;
+    impl_->submit_prefill(op);
+    if (!op.st.ok()) {
+        return Row(op.st);
+    }
+    NumericHealthReport health{};
+    if (!op.want_logits) {
+        if (op.sampled.size() != 1) {
+            return Row(ErrorCode::BackendError, "shared prompt load returned no token");
+        }
+        health.healthy = true;
+        impl_->telemetry.numeric_inspections++;
+        impl_->telemetry.last_numeric_health = health;
+        std::vector<float> out(impl_->n_vocab, 0.0f);
+        out[static_cast<size_t>(op.sampled.front())] = 1.0f;
+        return Row(std::move(out));
+    }
+    if (op.logits.size() != 1) {
+        return Row(ErrorCode::BackendError, "shared prompt load returned no logits");
+    }
+    std::vector<float> out = std::move(op.logits.front());
+    Status num_st = inspect_and_apply_numeric_policy(
+        out.data(), static_cast<int64_t>(out.size()), impl_->opts.numeric_policy, impl_->opts.numeric_clamp_abs_max, &health);
+    impl_->telemetry.numeric_inspections++;
+    impl_->telemetry.last_numeric_health = health;
+    if (!num_st.ok()) {
+        if (health.state_invalidated) {
+            (void)reset_state();
+        }
+        return Row(num_st);
+    }
+    return Row(std::move(out));
 }
 
 void LlamaCppBackend::begin_generation() noexcept {

@@ -279,6 +279,18 @@ public:
     virtual void set_background(bool background) noexcept { (void)background; }
     virtual void begin_setup() noexcept {}
     virtual void end_setup() noexcept {}
+    // Prompt loads of requests that arrive together, in shared passes. A request that is about to load a prompt
+    // calls announce_prompt_load() as soon as it knows (before it waits for anything), then either
+    // forward_tokens_merged(tokens, true) or retract_prompt_load(). The first request to arrive waits for the
+    // announced ones (a few tens of ms at most) and one pass reads the rows of all of them: the weights are read
+    // once, and rows that alone stay under the tensor-core path of a backend reach it together. Called without the
+    // device held (after end_setup()). Backends without shared passes load the prompt as forward_tokens does.
+    virtual Result<std::vector<float>> forward_tokens_merged(const std::vector<int32_t>& input_tokens, bool announced) {
+        if (announced) retract_prompt_load();
+        return forward_tokens(input_tokens, 0);
+    }
+    virtual void announce_prompt_load() noexcept {}
+    virtual void retract_prompt_load() noexcept {}
     virtual void begin_generation() noexcept {}
     virtual void end_generation() noexcept {}
     virtual uint32_t generating_streams() const noexcept { return 0; }
@@ -522,6 +534,8 @@ public:
         uint64_t device_snapshots_restored = 0;
         uint32_t device_snapshot_slot_count = 0;
         uint64_t batched_passes = 0;           // shared draft / verify passes run for generating streams
+        uint64_t merged_prefill_groups = 0; // groups of prompt loads that shared their passes
+        uint64_t merged_prefill_loads = 0;         // prompt loads in those groups
         uint64_t batched_ops = 0;              // stream ops served by those passes (ops / passes = mean streams per pass)
         uint64_t last_state_snapshot_bytes = 0;
         NumericHealthReport last_numeric_health{};
@@ -565,6 +579,9 @@ public:
     std::vector<int32_t> stream_context_tokens(uint32_t stream) const override;
     void begin_setup() noexcept override;
     void end_setup() noexcept override;
+    Result<std::vector<float>> forward_tokens_merged(const std::vector<int32_t>& input_tokens, bool announced) override;
+    void announce_prompt_load() noexcept override;
+    void retract_prompt_load() noexcept override;
     void begin_generation() noexcept override;
     void end_generation() noexcept override;
     uint32_t generating_streams() const noexcept override;

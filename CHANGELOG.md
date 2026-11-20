@@ -3,6 +3,22 @@
 Versions of the Sixi-ASI Engine, newest first. Numbers are from NVIDIA Jetson AGX Thor; how each was measured is in
 [docs/RESULTS.md](docs/RESULTS.md).
 
+## 1.0.0
+
+The three release candidates ran under two agents (one that talks and listens, one that asks for many samples of
+an answer) and next to another engine's published recipe. What that brought:
+
+| Area | Change |
+|---|---|
+| Prompt reuse | requests for the same prompt that arrive together load it once: the first loads it, the others start from its state. Four requests for one 4,100-token prompt are answered after 8.0 s instead of 31.2 s. Until now only `n` shared a prompt load, and `n` cannot stream |
+| Prompt reuse | `"cache_control": {"type": "ephemeral"}` on a content part keeps what was computed up to its end, like the end of a long system prompt: a second question about a 3,000-token document inside a user message, asked after ten other prompts, loads 20 tokens instead of all of them (0.5 s instead of 5 s). A client can mark a document, a list of tools, or the message it may come back to |
+| API | `stream_options.include_usage`; `usage.prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens` next to the engine's own names; `thinking_budget` as a name of the reasoning budget; `POST /tokenize`; a stream that has nothing to send for 15 s (a long prompt is loading) gets a comment line, so that a proxy on the way keeps the connection (`--sse-keepalive`) |
+| Checks | `"draft": false` decodes one request without drafts, and `scripts/exact_check.py` asks every prompt both ways on the running server: 9 of 12 answers identical, 3.3x faster with drafts. `scripts/streams_bench.py` measures many requests at once with a prompt of its own for every request and reports decoding and wall-clock figures apart |
+| Speed | a request that is alone on a server started with `--parallel 8` writes 55 instead of 48.5 tok/s: the rollback ring stays 16 deep there (0.9 GB) |
+| Flash-Next | prompts load 1.8 times faster: 18,500 tokens in 31 s instead of 56 s, 4,400 in 7.6 s instead of 13.9 s (one pass of 2,048 rows: 2.5 s instead of 4.6 s). On the Thor the expert layers of a wide pass had been multiplied one expert at a time |
+| Bursts | `--merge-loads` (off by default): the prompts of requests that arrive at the same moment load in shared passes, about a fifth less time for such a burst |
+| Memory | with `--draft-model` the model's built-in draft head is not loaded (`--no-mtp` as a second name of `--no-mtp-load`) |
+
 ## 1.0.0-rc3
 
 Found in two days of use by an agent that talks and listens (about 4,500 chat requests and 2,600 speech requests,
