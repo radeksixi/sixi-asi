@@ -61,6 +61,13 @@ bool ends_with(std::string_view s, std::string_view p) noexcept {
     return s.size() >= p.size() && s.compare(s.size() - p.size(), p.size(), p) == 0;
 }
 
+// Safe JSON serialization: replace any truncated/malformed UTF-8 bytes with U+FFFD
+// instead of throwing nlohmann::json::type_error.316 on multibyte/BiDi token boundaries.
+template <typename J>
+std::string safe_json_dump(const J& j) {
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 // Python/Jinja `tojson`-compatible serialization: ", " and ": " separators, insertion order preserved,
 // non-ASCII escaped as \uXXXX (json.dumps default ensure_ascii=True).
 void dump_python_json(const ojson& v, std::string& out) {
@@ -76,7 +83,7 @@ void dump_python_json(const ojson& v, std::string& out) {
                 std::snprintf(buf, sizeof(buf), "%.1f", d);
                 out += buf;
             } else {
-                out += v.dump();
+                out += safe_json_dump(v);
             }
             break;
         }
@@ -148,7 +155,7 @@ void dump_python_json(const ojson& v, std::string& out) {
             out.push_back('}');
             break;
         }
-        default: out += v.dump(); break;
+        default: out += safe_json_dump(v); break;
     }
 }
 
@@ -685,7 +692,7 @@ ToolValidationResult ToolCallValidator::parse_and_validate(
             }
 
             // Canonical JSON serialization (nlohmann::json sorts object keys lexicographically)
-            vcall.arguments_json = args_obj.dump();
+            vcall.arguments_json = safe_json_dump(args_obj);
 
             // Check tool existence and schema
             Status verify_st = verify_before_execution(vcall, registered_tools);
@@ -1400,7 +1407,7 @@ std::optional<std::string> unsupported_schema_feature(const ojson& s, const std:
         }
     }
     if (s.contains("format") && (!s["format"].is_string() || kFormats.count(s["format"].get<std::string>()) == 0)) {
-        return path + ": 'format' " + s["format"].dump() + " is not supported (date, time, date-time, uuid)";
+        return path + ": 'format' " + safe_json_dump(s["format"]) + " is not supported (date, time, date-time, uuid)";
     }
     for (const char* comb : {"$ref", "anyOf"}) {
         if (!s.contains(comb)) {
@@ -1420,7 +1427,7 @@ std::optional<std::string> unsupported_schema_feature(const ojson& s, const std:
         for (const auto& r : req) {
             if (!r.is_string() || !s.contains("properties") || !s["properties"].is_object() ||
                 !s["properties"].contains(r.get<std::string>())) {
-                return path + ": required key " + r.dump() + " is not in 'properties'";
+                return path + ": required key " + safe_json_dump(r) + " is not in 'properties'";
             }
         }
     }
@@ -1524,7 +1531,7 @@ Status parse_chat_request(const ojson& j, const std::string& default_model, uint
                             if (fn["arguments"].is_string()) {
                                 ref.arguments_json = fn["arguments"].get<std::string>();
                             } else if (fn["arguments"].is_object()) {
-                                ref.arguments_json = fn["arguments"].dump();
+                                ref.arguments_json = safe_json_dump(fn["arguments"]);
                             }
                         }
                         if (!ref.name.empty()) {
@@ -1629,10 +1636,10 @@ Status parse_chat_request(const ojson& j, const std::string& default_model, uint
                     return Status::Error(ErrorCode::InvalidArgument,
                                          "'response_format' of type json_schema needs json_schema.schema (an object)");
                 }
-                req.response_schema_json = rf["json_schema"]["schema"].dump();
+                req.response_schema_json = safe_json_dump(rf["json_schema"]["schema"]);
             } else if (type == "json_object") {
                 req.response_schema_json = (rf.contains("schema") && rf["schema"].is_object())
-                                               ? rf["schema"].dump()
+                                               ? safe_json_dump(rf["schema"])
                                                : std::string("{\"type\":\"object\"}");
             } else if (type != "text") {
                 return Status::Error(ErrorCode::InvalidArgument,
@@ -1647,7 +1654,7 @@ Status parse_chat_request(const ojson& j, const std::string& default_model, uint
                 ToolDefinition td = tool_definition_from_json(fn_obj);
                 if (!td.name.empty()) {
                     req.tools.push_back(std::move(td));
-                    req.tools_json.push_back(t.dump());
+                    req.tools_json.push_back(safe_json_dump(t));
                 }
             }
         }
@@ -2278,15 +2285,32 @@ SixiServer::SixiServer(
                         }
                         return true;
                     };
-                    auto res = handle_chat_completion(chat_req, &cancel_flag, stream_cb);
-                    if (!res.ok() && !cancel_flag.load(std::memory_order_acquire)) {
-                        json err;
-                        err["error"] = {
-                            {"code", error_code_to_string(res.code())},
-                            {"message", res.message()}
-                        };
-                        const std::string ev = "data: " + client_json(err) + "\n\n";
-                        (void)sink.write(ev.data(), ev.size());
+                    try {
+                        auto res = handle_chat_completion(chat_req, &cancel_flag, stream_cb);
+                        if (!res.ok() && !cancel_flag.load(std::memory_order_acquire)) {
+                            json err;
+                            err["error"] = {
+                                {"code", error_code_to_string(res.code())},
+                                {"message", res.message()}
+                            };
+                            const std::string ev = "data: " + client_json(err) + "\n\n";
+                            (void)sink.write(ev.data(), ev.size());
+                        }
+                    } catch (const std::exception& e) {
+                        if (!cancel_flag.load(std::memory_order_acquire)) {
+                            json err;
+                            err["error"] = {
+                                {"code", "internal_error"},
+                                {"message", e.what()}
+                            };
+                            const std::string ev = "data: " + client_json(err) + "\n\n";
+                            (void)sink.write(ev.data(), ev.size());
+                        }
+                    } catch (...) {
+                        if (!cancel_flag.load(std::memory_order_acquire)) {
+                            const std::string ev = "data: {\"error\":{\"code\":\"internal_error\",\"message\":\"unexpected streaming error\"}}\n\n";
+                            (void)sink.write(ev.data(), ev.size());
+                        }
                     }
                     sink.done();
                     return true;
